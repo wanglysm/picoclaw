@@ -613,6 +613,28 @@ func (c *WeComWSChannel) connect() error {
 	c.connected = true
 	c.connMu.Unlock()
 
+	// 设置心跳超时和标准 ping/pong 处理器 (处理底层心跳)
+	deadline := time.Duration(c.config.HeartbeatInterval) * 3 * time.Second
+	conn.SetReadDeadline(time.Now().Add(deadline))
+	
+	originalPingHandler := conn.PingHandler()
+	conn.SetPingHandler(func(appData string) error {
+		conn.SetReadDeadline(time.Now().Add(deadline))
+		if originalPingHandler != nil {
+			return originalPingHandler(appData)
+		}
+		return nil
+	})
+	
+	originalPongHandler := conn.PongHandler()
+	conn.SetPongHandler(func(appData string) error {
+		conn.SetReadDeadline(time.Now().Add(deadline))
+		if originalPongHandler != nil {
+			return originalPongHandler(appData)
+		}
+		return nil
+	})
+
 	logger.InfoC("wecom_ws", "WebSocket connected")
 
 	// 触发连接成功事件
@@ -696,6 +718,9 @@ func (c *WeComWSChannel) readLoop() {
 			return
 		}
 
+		// 更新读超时，心跳间隔的 3 倍，如果没有收到任何消息则主动断开
+		conn.SetReadDeadline(time.Now().Add(time.Duration(c.config.HeartbeatInterval) * 3 * time.Second))
+
 		// 先读取原始消息
 		messageType, rawMessage, err := conn.ReadMessage()
 		if err != nil {
@@ -746,6 +771,8 @@ func (c *WeComWSChannel) writeLoop() {
 				continue
 			}
 
+			// 更新写超时
+			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := conn.WriteJSON(msg); err != nil {
 				logger.ErrorCF("wecom_ws", "WebSocket write error", map[string]any{
 					"error": err.Error(),
