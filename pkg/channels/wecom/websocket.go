@@ -503,13 +503,14 @@ func (c *WeComWSChannel) connectionManager() {
 			})
 
 			c.reconnects++
-			if c.reconnects > c.config.MaxReconnectAttempts {
-				logger.ErrorC("wecom_ws", "Max reconnection attempts reached, giving up")
+			if c.config.MaxReconnectAttempts > 0 && c.reconnects > c.config.MaxReconnectAttempts {
+				logger.ErrorC("wecom_ws", "Max reconnection attempts reached, but continuing to loop to ensure service alive")
 				// 触发错误事件
 				c.eventManager.Emit(EventError, EventPayloadError{
 					Error: fmt.Errorf("max reconnection attempts reached"),
 				})
-				return
+				// 不退出，只保留最大延迟
+				c.reconnects = c.config.MaxReconnectAttempts
 			}
 
 			// 指数退避重连
@@ -539,14 +540,28 @@ func (c *WeComWSChannel) connectionManager() {
 		// 连接成功，重置重连计数
 		c.reconnects = 0
 
+		// 使用上下文控制这部分的读写协程生命周期
+		connCtx, connCancel := context.WithCancel(c.ctx)
+
 		// 启动读写协程
 		var wg sync.WaitGroup
-		wg.Add(2)
+		wg.Add(1)
+
+		// 清空旧的发送队列，防止将上一次遗留的数据发给新建立的连接
+	drainLoop:
+		for {
+			select {
+			case <-c.sendCh:
+			default:
+				break drainLoop
+			}
+		}
 
 		// 先启动 writeLoop，确保订阅消息能被发送
 		go func() {
 			defer wg.Done()
-			c.writeLoop()
+			defer connCancel()
+			c.writeLoop(connCtx)
 		}()
 
 		// 等待一小段时间确保 writeLoop 已启动
@@ -558,17 +573,22 @@ func (c *WeComWSChannel) connectionManager() {
 				"error": err.Error(),
 			})
 			c.closeConnection()
+			connCancel()
+			wg.Wait()
 			continue
 		}
 
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c.readLoop()
+			defer connCancel()
+			c.readLoop(connCtx)
 		}()
 
 		// 等待读写协程结束
 		wg.Wait()
 
+		c.closeConnection()
 		logger.InfoC("wecom_ws", "Connection closed, will reconnect...")
 	}
 }
@@ -592,7 +612,7 @@ func (c *WeComWSChannel) connect() error {
 	headers := http.Header{}
 
 	logger.DebugC("wecom_ws", "Dialing WebSocket...")
-	conn, resp, err := dialer.Dial(c.config.WSURL, headers)
+	conn, resp, err := dialer.DialContext(c.ctx, c.config.WSURL, headers)
 	if err != nil {
 		logger.ErrorCF("wecom_ws", "WebSocket dial error", map[string]any{
 			"error": err.Error(),
@@ -616,7 +636,7 @@ func (c *WeComWSChannel) connect() error {
 	// 设置心跳超时和标准 ping/pong 处理器 (处理底层心跳)
 	deadline := time.Duration(c.config.HeartbeatInterval) * 3 * time.Second
 	conn.SetReadDeadline(time.Now().Add(deadline))
-	
+
 	originalPingHandler := conn.PingHandler()
 	conn.SetPingHandler(func(appData string) error {
 		conn.SetReadDeadline(time.Now().Add(deadline))
@@ -625,7 +645,7 @@ func (c *WeComWSChannel) connect() error {
 		}
 		return nil
 	})
-	
+
 	originalPongHandler := conn.PongHandler()
 	conn.SetPongHandler(func(appData string) error {
 		conn.SetReadDeadline(time.Now().Add(deadline))
@@ -700,12 +720,12 @@ func (c *WeComWSChannel) closeConnection() {
 }
 
 // readLoop 读取 WebSocket 消息
-func (c *WeComWSChannel) readLoop() {
+func (c *WeComWSChannel) readLoop(ctx context.Context) {
 	defer c.closeConnection()
 
 	for {
 		select {
-		case <-c.ctx.Done():
+		case <-ctx.Done():
 			return
 		default:
 		}
@@ -753,13 +773,13 @@ func (c *WeComWSChannel) readLoop() {
 }
 
 // writeLoop 写入 WebSocket 消息
-func (c *WeComWSChannel) writeLoop() {
+func (c *WeComWSChannel) writeLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Duration(c.config.HeartbeatInterval) * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-c.ctx.Done():
+		case <-ctx.Done():
 			return
 
 		case msg := <-c.sendCh:
@@ -768,7 +788,8 @@ func (c *WeComWSChannel) writeLoop() {
 			c.connMu.RUnlock()
 
 			if conn == nil {
-				continue
+				logger.DebugC("wecom_ws", "Connection is nil, exiting writeLoop")
+				return
 			}
 
 			// 更新写超时
@@ -777,10 +798,20 @@ func (c *WeComWSChannel) writeLoop() {
 				logger.ErrorCF("wecom_ws", "WebSocket write error", map[string]any{
 					"error": err.Error(),
 				})
+				c.closeConnection()
 				return
 			}
 
 		case <-ticker.C:
+			c.connMu.RLock()
+			conn := c.wsConn
+			c.connMu.RUnlock()
+
+			if conn == nil {
+				logger.DebugC("wecom_ws", "Connection is nil, exiting writeLoop on ticker")
+				return
+			}
+
 			// 发送心跳
 			if err := c.sendPing(); err != nil {
 				logger.ErrorCF("wecom_ws", "Ping failed", map[string]any{
