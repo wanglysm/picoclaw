@@ -49,6 +49,7 @@ type AgentLoop struct {
 	cmdRegistry    *commands.Registry
 	mcp            mcpRuntime
 	mu             sync.RWMutex
+	reloadFunc     func() error
 	// Track active requests for safe provider cleanup
 	activeRequests sync.WaitGroup
 }
@@ -239,6 +240,11 @@ func registerSharedTools(
 		if (spawnEnabled || spawnStatusEnabled) && cfg.Tools.IsToolEnabled("subagent") {
 			subagentManager := tools.NewSubagentManager(provider, agent.Model, agent.Workspace)
 			subagentManager.SetLLMOptions(agent.MaxTokens, agent.Temperature)
+			// Clone the parent's tool registry so subagents can use all
+			// tools registered so far (file, web, etc.) but NOT spawn/
+			// spawn_status which are added below — preventing recursive
+			// subagent spawning.
+			subagentManager.SetTools(agent.Tools.Clone())
 			if spawnEnabled {
 				spawnTool := tools.NewSpawnTool(subagentManager)
 				currentAgentID := agentID
@@ -272,58 +278,64 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 				return nil
 			}
 			// Process message
-			// TODO: Re-enable media cleanup after inbound media is properly consumed by the agent.
-			// Currently disabled because files are deleted before the LLM can access their content.
-			// defer func() {
-			// 	if al.mediaStore != nil && msg.MediaScope != "" {
-			// 		if releaseErr := al.mediaStore.ReleaseAll(msg.MediaScope); releaseErr != nil {
-			// 			logger.WarnCF("agent", "Failed to release media", map[string]any{
-			// 				"scope": msg.MediaScope,
-			// 				"error": releaseErr.Error(),
-			// 			})
-			// 		}
-			// 	}
-			// }()
+			func() {
+				defer func() {
+					if al.channelManager != nil {
+						al.channelManager.InvokeTypingStop(msg.Channel, msg.ChatID)
+					}
+				}()
+				// TODO: Re-enable media cleanup after inbound media is properly consumed by the agent.
+				// Currently disabled because files are deleted before the LLM can access their content.
+				// defer func() {
+				// 	if al.mediaStore != nil && msg.MediaScope != "" {
+				// 		if releaseErr := al.mediaStore.ReleaseAll(msg.MediaScope); releaseErr != nil {
+				// 			logger.WarnCF("agent", "Failed to release media", map[string]any{
+				// 				"scope": msg.MediaScope,
+				// 				"error": releaseErr.Error(),
+				// 			})
+				// 		}
+				// 	}
+				// }()
 
-			response, err := al.processMessage(ctx, msg)
-			if err != nil {
-				response = fmt.Sprintf("Error processing message: %v", err)
-			}
+				response, err := al.processMessage(ctx, msg)
+				if err != nil {
+					response = fmt.Sprintf("Error processing message: %v", err)
+				}
 
-			if response != "" {
-				// Check if the message tool already sent a response during this round.
-				// If so, skip publishing to avoid duplicate messages to the user.
-				// Use default agent's tools to check (message tool is shared).
-				alreadySent := false
-				defaultAgent := al.GetRegistry().GetDefaultAgent()
-				if defaultAgent != nil {
-					if tool, ok := defaultAgent.Tools.Get("message"); ok {
-						if mt, ok := tool.(*tools.MessageTool); ok {
-							alreadySent = mt.HasSentInRound()
+				if response != "" {
+					// Check if the message tool already sent a response during this round.
+					// If so, skip publishing to avoid duplicate messages to the user.
+					// Use default agent's tools to check (message tool is shared).
+					alreadySent := false
+					defaultAgent := al.GetRegistry().GetDefaultAgent()
+					if defaultAgent != nil {
+						if tool, ok := defaultAgent.Tools.Get("message"); ok {
+							if mt, ok := tool.(*tools.MessageTool); ok {
+								alreadySent = mt.HasSentInRound()
+							}
 						}
 					}
-				}
-
-				if !alreadySent {
-					al.bus.PublishOutbound(ctx, bus.OutboundMessage{
-						Channel: msg.Channel,
-						ChatID:  msg.ChatID,
-						Content: response,
-					})
-					logger.InfoCF("agent", "Published outbound response",
-						map[string]any{
-							"channel":     msg.Channel,
-							"chat_id":     msg.ChatID,
-							"content_len": len(response),
+					if !alreadySent {
+						al.bus.PublishOutbound(ctx, bus.OutboundMessage{
+							Channel: msg.Channel,
+							ChatID:  msg.ChatID,
+							Content: response,
 						})
-				} else {
-					logger.DebugCF(
-						"agent",
-						"Skipped outbound (message tool already sent)",
-						map[string]any{"channel": msg.Channel},
-					)
+						logger.InfoCF("agent", "Published outbound response",
+							map[string]any{
+								"channel":     msg.Channel,
+								"chat_id":     msg.ChatID,
+								"content_len": len(response),
+							})
+					} else {
+						logger.DebugCF(
+							"agent",
+							"Skipped outbound (message tool already sent)",
+							map[string]any{"channel": msg.Channel},
+						)
+					}
 				}
-			}
+			}()
 		default:
 			time.Sleep(time.Microsecond * 200)
 		}
@@ -491,6 +503,11 @@ func (al *AgentLoop) SetMediaStore(s media.MediaStore) {
 // SetTranscriber injects a voice transcriber for agent-level audio transcription.
 func (al *AgentLoop) SetTranscriber(t voice.Transcriber) {
 	al.transcriber = t
+}
+
+// SetReloadFunc sets the callback function for triggering config reload.
+func (al *AgentLoop) SetReloadFunc(fn func() error) {
+	al.reloadFunc = fn
 }
 
 var audioAnnotationRe = regexp.MustCompile(`\[(voice|audio)(?::[^\]]*)?\]`)
@@ -1037,6 +1054,19 @@ func (al *AgentLoop) runLLMIteration(
 		// Build tool definitions
 		providerToolDefs := agent.Tools.ToProviderDefs()
 
+		// Determine whether the provider's native web search should replace
+		// the client-side web_search tool for this request. Only enable when web
+		// search is actually enabled and registered (so users who disabled web
+		// access do not get provider-side search or billing).
+		_, hasWebSearch := agent.Tools.Get("web_search")
+		useNativeSearch := al.cfg.Tools.Web.PreferNative &&
+			isNativeSearchProvider(agent.Provider) &&
+			hasWebSearch
+
+		if useNativeSearch {
+			providerToolDefs = filterClientWebSearch(providerToolDefs)
+		}
+
 		// Log LLM request details
 		logger.DebugCF("agent", "LLM request",
 			map[string]any{
@@ -1045,6 +1075,7 @@ func (al *AgentLoop) runLLMIteration(
 				"model":             activeModel,
 				"messages_count":    len(messages),
 				"tools_count":       len(providerToolDefs),
+				"native_search":     useNativeSearch,
 				"max_tokens":        agent.MaxTokens,
 				"temperature":       agent.Temperature,
 				"system_prompt_len": len(messages[0].Content),
@@ -1066,6 +1097,9 @@ func (al *AgentLoop) runLLMIteration(
 			"max_tokens":       agent.MaxTokens,
 			"temperature":      agent.Temperature,
 			"prompt_cache_key": agent.ID,
+		}
+		if useNativeSearch {
+			llmOpts["native_search"] = true
 		}
 		// parseThinkingLevel guarantees ThinkingOff for empty/unknown values,
 		// so checking != ThinkingOff is sufficient.
@@ -1294,6 +1328,22 @@ func (al *AgentLoop) runLLMIteration(
 						"iteration": iteration,
 					})
 
+				// Send tool feedback to chat channel if enabled
+				if al.cfg.Agents.Defaults.IsToolFeedbackEnabled() && opts.Channel != "" {
+					feedbackPreview := utils.Truncate(
+						string(argsJSON),
+						al.cfg.Agents.Defaults.GetToolFeedbackMaxArgsLength(),
+					)
+					feedbackMsg := fmt.Sprintf("\U0001f527 `%s`\n```\n%s\n```", tc.Name, feedbackPreview)
+					fbCtx, fbCancel := context.WithTimeout(ctx, 3*time.Second)
+					_ = al.bus.PublishOutbound(fbCtx, bus.OutboundMessage{
+						Channel: opts.Channel,
+						ChatID:  opts.ChatID,
+						Content: feedbackMsg,
+					})
+					fbCancel()
+				}
+
 				// Create async callback for tools that implement AsyncExecutor.
 				// When the background work completes, this publishes the result
 				// as an inbound system message so processSystemMessage routes it
@@ -1433,7 +1483,7 @@ func (al *AgentLoop) selectCandidates(
 	history []providers.Message,
 ) (candidates []providers.FallbackCandidate, model string) {
 	if agent.Router == nil || len(agent.LightCandidates) == 0 {
-		return agent.Candidates, agent.Model
+		return agent.Candidates, resolvedCandidateModel(agent.Candidates, agent.Model)
 	}
 
 	_, usedLight, score := agent.Router.SelectModel(userMsg, history, agent.Model)
@@ -1444,7 +1494,7 @@ func (al *AgentLoop) selectCandidates(
 				"score":     score,
 				"threshold": agent.Router.Threshold(),
 			})
-		return agent.Candidates, agent.Model
+		return agent.Candidates, resolvedCandidateModel(agent.Candidates, agent.Model)
 	}
 
 	logger.InfoCF("agent", "Model routing: light model selected",
@@ -1454,7 +1504,7 @@ func (al *AgentLoop) selectCandidates(
 			"score":       score,
 			"threshold":   agent.Router.Threshold(),
 		})
-	return agent.LightCandidates, agent.Router.LightModel()
+	return agent.LightCandidates, resolvedCandidateModel(agent.LightCandidates, agent.Router.LightModel())
 }
 
 // maybeSummarize triggers summarization if the session history exceeds thresholds.
@@ -1909,13 +1959,45 @@ func (al *AgentLoop) buildCommandsRuntime(agent *AgentInstance, opts *processOpt
 			return nil
 		},
 	}
+	rt.ReloadConfig = func() error {
+		if al.reloadFunc == nil {
+			return fmt.Errorf("reload not configured")
+		}
+		return al.reloadFunc()
+	}
 	if agent != nil {
 		rt.GetModelInfo = func() (string, string) {
-			return agent.Model, cfg.Agents.Defaults.Provider
+			return agent.Model, resolvedCandidateProvider(agent.Candidates, cfg.Agents.Defaults.Provider)
 		}
 		rt.SwitchModel = func(value string) (string, error) {
+			value = strings.TrimSpace(value)
+			modelCfg, err := resolvedModelConfig(cfg, value, agent.Workspace)
+			if err != nil {
+				return "", err
+			}
+
+			nextProvider, _, err := providers.CreateProviderFromConfig(modelCfg)
+			if err != nil {
+				return "", fmt.Errorf("failed to initialize model %q: %w", value, err)
+			}
+
+			nextCandidates := resolveModelCandidates(cfg, cfg.Agents.Defaults.Provider, modelCfg.Model, agent.Fallbacks)
+			if len(nextCandidates) == 0 {
+				return "", fmt.Errorf("model %q did not resolve to any provider candidates", value)
+			}
+
 			oldModel := agent.Model
+			oldProvider := agent.Provider
 			agent.Model = value
+			agent.Provider = nextProvider
+			agent.Candidates = nextCandidates
+			agent.ThinkingLevel = parseThinkingLevel(modelCfg.ThinkingLevel)
+
+			if oldProvider != nil && oldProvider != nextProvider {
+				if stateful, ok := oldProvider.(providers.StatefulProvider); ok {
+					stateful.Close()
+				}
+			}
 			return oldModel, nil
 		}
 
@@ -1974,6 +2056,28 @@ func extractParentPeer(msg bus.InboundMessage) *routing.RoutePeer {
 		return nil
 	}
 	return &routing.RoutePeer{Kind: parentKind, ID: parentID}
+}
+
+// isNativeSearchProvider reports whether the given LLM provider implements
+// NativeSearchCapable and returns true for SupportsNativeSearch.
+func isNativeSearchProvider(p providers.LLMProvider) bool {
+	if ns, ok := p.(providers.NativeSearchCapable); ok {
+		return ns.SupportsNativeSearch()
+	}
+	return false
+}
+
+// filterClientWebSearch returns a copy of tools with the client-side
+// web_search tool removed. Used when native provider search is preferred.
+func filterClientWebSearch(tools []providers.ToolDefinition) []providers.ToolDefinition {
+	result := make([]providers.ToolDefinition, 0, len(tools))
+	for _, t := range tools {
+		if strings.EqualFold(t.Function.Name, "web_search") {
+			continue
+		}
+		result = append(result, t)
+	}
+	return result
 }
 
 // Helper to extract provider from registry for cleanup
