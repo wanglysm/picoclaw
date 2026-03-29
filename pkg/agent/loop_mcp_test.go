@@ -7,6 +7,8 @@
 package agent
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/sipeed/picoclaw/pkg/config"
@@ -72,4 +74,51 @@ func TestServerIsDeferred(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResolveAgentMCPServerAllowlist(t *testing.T) {
+	workspace := t.TempDir()
+	agentPath := filepath.Join(workspace, "AGENT.md")
+	content := `---
+mcpServers: [GitHub, filesystem, github]
+---
+# Agent
+`
+	if err := os.WriteFile(agentPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile(AGENT.md) error = %v", err)
+	}
+
+	allowlist := resolveAgentMCPServerAllowlist(loadAgentDefinition(workspace))
+	if len(allowlist) != 2 {
+		t.Fatalf("len(allowlist) = %d, want 2", len(allowlist))
+	}
+	if _, ok := allowlist["github"]; !ok {
+		t.Fatal("expected github to be present in MCP allowlist")
+	}
+	if _, ok := allowlist["filesystem"]; !ok {
+		t.Fatal("expected filesystem to be present in MCP allowlist")
+	}
+}
+
+func TestAgentInstance_AllowsMCPServer(t *testing.T) {
+	t.Run("nil allowlist allows all", func(t *testing.T) {
+		agent := &AgentInstance{}
+		if !agent.AllowsMCPServer("github") {
+			t.Fatal("expected nil MCP allowlist to allow all servers")
+		}
+	})
+
+	t.Run("explicit allowlist filters servers", func(t *testing.T) {
+		agent := &AgentInstance{
+			MCPServerAllowlist: map[string]struct{}{
+				"github": {},
+			},
+		}
+		if !agent.AllowsMCPServer("GitHub") {
+			t.Fatal("expected MCP server matching to be case-insensitive")
+		}
+		if agent.AllowsMCPServer("filesystem") {
+			t.Fatal("expected filesystem to be blocked by MCP allowlist")
+		}
+	})
 }

@@ -26,3 +26,20 @@ func resolveAgentToolAllowlist(definition AgentContextDefinition) []string {
 	sort.Strings(result)
 	return result
 }
+
+func resolveAgentMCPServerAllowlist(definition AgentContextDefinition) map[string]struct{} {
+	if definition.Agent == nil || definition.Agent.Frontmatter.MCPServers == nil {
+		return nil
+	}
+
+	allowlist := make(map[string]struct{}, len(definition.Agent.Frontmatter.MCPServers))
+	for _, raw := range definition.Agent.Frontmatter.MCPServers {
+		trimmed := strings.ToLower(strings.TrimSpace(raw))
+		if trimmed == "" {
+			continue
+		}
+		allowlist[trimmed] = struct{}{}
+	}
+
+	return allowlist
+}

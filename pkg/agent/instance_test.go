@@ -287,6 +287,7 @@ func TestNewAgentInstance_UsesFrontmatterModelAndSkills(t *testing.T) {
 		"AGENT.md": `---
 model: frontmatter-model
 skills: [frontmatter-skill]
+mcpServers: [GitHub, filesystem]
 ---
 # Agent
 
@@ -318,5 +319,14 @@ Use frontmatter identity.
 	}
 	if len(agent.SkillsFilter) != 1 || agent.SkillsFilter[0] != "frontmatter-skill" {
 		t.Fatalf("agent.SkillsFilter = %v, want [frontmatter-skill]", agent.SkillsFilter)
+	}
+	if !agent.AllowsMCPServer("github") {
+		t.Fatal("expected github MCP server to be allowed from frontmatter")
+	}
+	if !agent.AllowsMCPServer("FILESYSTEM") {
+		t.Fatal("expected filesystem MCP server matching to be case-insensitive")
+	}
+	if agent.AllowsMCPServer("slack") {
+		t.Fatal("expected slack MCP server to be blocked by frontmatter allowlist")
 	}
 }

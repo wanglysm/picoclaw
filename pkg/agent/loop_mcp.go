@@ -124,6 +124,15 @@ func (al *AgentLoop) ensureMCPInitialized(ctx context.Context) error {
 					if !ok {
 						continue
 					}
+					if !agent.AllowsMCPServer(serverName) {
+						logger.DebugCF("agent", "Skipped MCP tool registration by agent mcpServers allowlist",
+							map[string]any{
+								"agent_id": agentID,
+								"server":   serverName,
+								"tool":     tool.Name,
+							})
+						continue
+					}
 
 					mcpTool := tools.NewMCPTool(mcpManager, serverName, tool)
 

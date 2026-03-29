@@ -39,6 +39,7 @@ type AgentInstance struct {
 	Tools                     *tools.ToolRegistry
 	Subagents                 *config.SubagentsConfig
 	SkillsFilter              []string
+	MCPServerAllowlist        map[string]struct{}
 	Candidates                []providers.FallbackCandidate
 
 	// Router is non-nil when model routing is configured and the light model
@@ -75,6 +76,7 @@ func NewAgentInstance(
 	allowReadPaths := buildAllowReadPatterns(cfg)
 	allowWritePaths := compilePatterns(cfg.Tools.AllowWritePaths)
 	agentToolAllowlist := resolveAgentToolAllowlist(definition)
+	agentMCPServerAllowlist := resolveAgentMCPServerAllowlist(definition)
 
 	toolsRegistry := tools.NewToolRegistry()
 	toolsRegistry.SetAllowlist(agentToolAllowlist)
@@ -237,6 +239,7 @@ func NewAgentInstance(
 		Tools:                     toolsRegistry,
 		Subagents:                 subagents,
 		SkillsFilter:              skillsFilter,
+		MCPServerAllowlist:        agentMCPServerAllowlist,
 		Candidates:                candidates,
 		Router:                    router,
 		LightCandidates:           lightCandidates,
@@ -293,6 +296,14 @@ func resolveAgentSkillsFilter(
 		return nil
 	}
 	return append([]string(nil), agentCfg.Skills...)
+}
+
+func (a *AgentInstance) AllowsMCPServer(serverName string) bool {
+	if a == nil || a.MCPServerAllowlist == nil {
+		return true
+	}
+	_, ok := a.MCPServerAllowlist[strings.ToLower(strings.TrimSpace(serverName))]
+	return ok
 }
 
 func compilePatterns(patterns []string) []*regexp.Regexp {
