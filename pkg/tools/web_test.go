@@ -1726,6 +1726,50 @@ func TestApplySogouRangeHint(t *testing.T) {
 	}
 }
 
+func TestPrefersDuckDuckGoQuery(t *testing.T) {
+	SetPreferredWebSearchLanguage("")
+	t.Cleanup(func() {
+		SetPreferredWebSearchLanguage("")
+	})
+
+	tests := []struct {
+		name  string
+		query string
+		want  bool
+	}{
+		{name: "english words", query: "golang web search", want: true},
+		{name: "english with numbers", query: "OpenAI o3 price 2026", want: true},
+		{name: "chinese", query: "今天上海天气", want: false},
+		{name: "mixed with han", query: "golang 中文 教程", want: false},
+		{name: "numbers only", query: "2026 04 15", want: false},
+		{name: "blank", query: "   ", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := prefersDuckDuckGoQuery(tt.query); got != tt.want {
+				t.Fatalf("prefersDuckDuckGoQuery(%q) = %v, want %v", tt.query, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPrefersDuckDuckGoQuery_FallsBackToPreferredLanguage(t *testing.T) {
+	SetPreferredWebSearchLanguage("en")
+	t.Cleanup(func() {
+		SetPreferredWebSearchLanguage("")
+	})
+
+	if !prefersDuckDuckGoQuery("2026 04 15") {
+		t.Fatal("numeric query should prefer DuckDuckGo when preferred language is English")
+	}
+
+	SetPreferredWebSearchLanguage("zh")
+	if prefersDuckDuckGoQuery("2026 04 15") {
+		t.Fatal("numeric query should prefer Sogou when preferred language is Chinese")
+	}
+}
+
 func TestWebTool_SogouPriorityAndExplicitProvider(t *testing.T) {
 	tool, err := NewWebSearchTool(WebSearchToolOptions{
 		SogouEnabled:         true,
@@ -1770,6 +1814,55 @@ func TestWebTool_AutoProviderPrefersConfiguredProvidersBeforeSogou(t *testing.T)
 	}
 	if _, ok := tool.provider.(*BraveSearchProvider); !ok {
 		t.Fatalf("expected BraveSearchProvider, got %T", tool.provider)
+	}
+}
+
+type stubSearchProvider struct {
+	result string
+	calls  []string
+}
+
+func (p *stubSearchProvider) Search(
+	_ context.Context,
+	query string,
+	_ int,
+	_ string,
+) (string, error) {
+	p.calls = append(p.calls, query)
+	return p.result, nil
+}
+
+func TestWebTool_AutoProviderRoutesQueryLanguageBetweenSogouAndDuckDuckGo(t *testing.T) {
+	sogouProvider := &stubSearchProvider{result: "via sogou"}
+	duckProvider := &stubSearchProvider{result: "via duckduckgo"}
+	tool := &WebSearchTool{
+		provider:   sogouProvider,
+		maxResults: 5,
+		providerResolver: func(query string) (SearchProvider, int) {
+			if prefersDuckDuckGoQuery(query) {
+				return duckProvider, 3
+			}
+			return sogouProvider, 5
+		},
+	}
+
+	enResult := tool.Execute(context.Background(), map[string]any{"query": "golang concurrency", "count": 10})
+	if enResult.IsError {
+		t.Fatalf("english Execute() returned error: %s", enResult.ForLLM)
+	}
+	if len(duckProvider.calls) != 1 || duckProvider.calls[0] != "golang concurrency" {
+		t.Fatalf("english query should use DuckDuckGo provider, calls=%v", duckProvider.calls)
+	}
+	if len(sogouProvider.calls) != 0 {
+		t.Fatalf("english query should not call Sogou provider, calls=%v", sogouProvider.calls)
+	}
+
+	zhResult := tool.Execute(context.Background(), map[string]any{"query": "今天上海天气"})
+	if zhResult.IsError {
+		t.Fatalf("chinese Execute() returned error: %s", zhResult.ForLLM)
+	}
+	if len(sogouProvider.calls) != 1 || sogouProvider.calls[0] != "今天上海天气" {
+		t.Fatalf("chinese query should use Sogou provider, calls=%v", sogouProvider.calls)
 	}
 }
 

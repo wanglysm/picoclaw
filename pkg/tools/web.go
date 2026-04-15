@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/logger"
@@ -56,6 +57,8 @@ var (
 	reSogouSnippet = regexp.MustCompile(`<div class="clamp\d*">\s*(.*?)\s*</div>`)
 	reSogouRealURL = regexp.MustCompile(`url=([^&]+)`)
 )
+
+var preferredWebSearchLanguage atomic.Value
 
 type APIKeyPool struct {
 	keys    []string
@@ -245,6 +248,27 @@ func mapBaiduRecencyFilter(rangeCode string) string {
 	default:
 		return ""
 	}
+}
+
+func normalizePreferredWebSearchLanguage(lang string) string {
+	lang = strings.ToLower(strings.TrimSpace(lang))
+	switch {
+	case strings.HasPrefix(lang, "zh"), lang == "chinese":
+		return "zh"
+	case strings.HasPrefix(lang, "en"), lang == "english":
+		return "en"
+	default:
+		return ""
+	}
+}
+
+func SetPreferredWebSearchLanguage(lang string) {
+	preferredWebSearchLanguage.Store(normalizePreferredWebSearchLanguage(lang))
+}
+
+func GetPreferredWebSearchLanguage() string {
+	lang, _ := preferredWebSearchLanguage.Load().(string)
+	return lang
 }
 
 type BraveSearchProvider struct {
@@ -1048,8 +1072,9 @@ func (p *BaiduSearchProvider) Search(
 }
 
 type WebSearchTool struct {
-	provider   SearchProvider
-	maxResults int
+	provider         SearchProvider
+	maxResults       int
+	providerResolver func(query string) (SearchProvider, int)
 }
 
 type WebSearchToolOptions struct {
@@ -1228,30 +1253,111 @@ func (opts WebSearchToolOptions) providerByName(name string) (SearchProvider, in
 	}
 }
 
-func NewWebSearchTool(opts WebSearchToolOptions) (*WebSearchTool, error) {
-	provider, maxResults, err := opts.providerByName(opts.Provider)
+func containsHan(text string) bool {
+	for _, r := range text {
+		if unicode.Is(unicode.Han, r) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsLatinLetter(text string) bool {
+	for _, r := range text {
+		if unicode.IsLetter(r) && unicode.In(r, unicode.Latin) {
+			return true
+		}
+	}
+	return false
+}
+
+func prefersDuckDuckGoQuery(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return GetPreferredWebSearchLanguage() == "en"
+	}
+	if containsHan(trimmed) {
+		return false
+	}
+	if containsLatinLetter(trimmed) {
+		return true
+	}
+	return GetPreferredWebSearchLanguage() == "en"
+}
+
+func (opts WebSearchToolOptions) buildProviderResolver() (func(query string) (SearchProvider, int), error) {
+	providerName := strings.ToLower(strings.TrimSpace(opts.Provider))
+	if providerName != "" && providerName != "auto" {
+		provider, maxResults, err := opts.providerByName(providerName)
+		if err != nil {
+			return nil, err
+		}
+		if provider == nil {
+			return func(string) (SearchProvider, int) { return nil, 0 }, nil
+		}
+		return func(string) (SearchProvider, int) { return provider, maxResults }, nil
+	}
+
+	for _, name := range []string{"perplexity", "brave", "searxng", "tavily"} {
+		provider, maxResults, err := opts.providerByName(name)
+		if err != nil {
+			return nil, err
+		}
+		if provider != nil {
+			return func(string) (SearchProvider, int) { return provider, maxResults }, nil
+		}
+	}
+
+	sogouProvider, sogouMaxResults, err := opts.providerByName("sogou")
 	if err != nil {
 		return nil, err
 	}
+	duckProvider, duckMaxResults, err := opts.providerByName("duckduckgo")
+	if err != nil {
+		return nil, err
+	}
+	if sogouProvider != nil && duckProvider != nil {
+		return func(query string) (SearchProvider, int) {
+			if prefersDuckDuckGoQuery(query) {
+				return duckProvider, duckMaxResults
+			}
+			return sogouProvider, sogouMaxResults
+		}, nil
+	}
+	if sogouProvider != nil {
+		return func(string) (SearchProvider, int) { return sogouProvider, sogouMaxResults }, nil
+	}
+	if duckProvider != nil {
+		return func(string) (SearchProvider, int) { return duckProvider, duckMaxResults }, nil
+	}
 
-	if provider == nil {
-		for _, name := range []string{"perplexity", "brave", "searxng", "tavily", "sogou", "duckduckgo", "baidu_search", "glm_search"} {
-			provider, maxResults, err = opts.providerByName(name)
-			if err != nil {
-				return nil, err
-			}
-			if provider != nil {
-				break
-			}
+	for _, name := range []string{"baidu_search", "glm_search"} {
+		provider, maxResults, err := opts.providerByName(name)
+		if err != nil {
+			return nil, err
+		}
+		if provider != nil {
+			return func(string) (SearchProvider, int) { return provider, maxResults }, nil
 		}
 	}
+
+	return func(string) (SearchProvider, int) { return nil, 0 }, nil
+}
+
+func NewWebSearchTool(opts WebSearchToolOptions) (*WebSearchTool, error) {
+	resolver, err := opts.buildProviderResolver()
+	if err != nil {
+		return nil, err
+	}
+	provider, maxResults := resolver("")
 	if provider == nil {
 		return nil, nil
 	}
 
 	return &WebSearchTool{
-		provider:   provider,
-		maxResults: maxResults,
+		provider:         provider,
+		maxResults:       maxResults,
+		providerResolver: resolver,
 	}, nil
 }
 
@@ -1294,13 +1400,22 @@ func (t *WebSearchTool) Execute(ctx context.Context, args map[string]any) *ToolR
 	}
 	query = strings.TrimSpace(query)
 
-	count64, err := getInt64Arg(args, "count", int64(t.maxResults))
+	provider := t.provider
+	maxResults := t.maxResults
+	if t.providerResolver != nil {
+		provider, maxResults = t.providerResolver(query)
+	}
+	if provider == nil {
+		return ErrorResult("search provider is not configured")
+	}
+
+	count64, err := getInt64Arg(args, "count", int64(maxResults))
 	if err != nil {
 		return ErrorResult(err.Error())
 	}
-	count := t.maxResults
+	count := maxResults
 	if count64 > 0 && count64 <= 10 {
-		count = int(count64)
+		count = min(int(count64), maxResults)
 	}
 
 	rangeCode, err := normalizeSearchRange("")
@@ -1318,7 +1433,7 @@ func (t *WebSearchTool) Execute(ctx context.Context, args map[string]any) *ToolR
 		}
 	}
 
-	result, err := t.provider.Search(ctx, query, count, rangeCode)
+	result, err := provider.Search(ctx, query, count, rangeCode)
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("search failed: %v", err))
 	}

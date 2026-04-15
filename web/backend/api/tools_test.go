@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/sipeed/picoclaw/pkg/config"
+	picotools "github.com/sipeed/picoclaw/pkg/tools"
 )
 
 func TestHandleListTools(t *testing.T) {
@@ -389,5 +390,26 @@ func TestResolveCurrentWebSearchProvider_PrefersConfiguredProvidersBeforeSogou(t
 
 	if got := resolveCurrentWebSearchProvider(cfg); got != "brave" {
 		t.Fatalf("resolveCurrentWebSearchProvider() = %q, want brave", got)
+	}
+}
+
+func TestResolveCurrentWebSearchProvider_UsesPreferredLanguageForSogouAndDuckDuckGo(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Tools.Web.Provider = "auto"
+	cfg.Tools.Web.Sogou.Enabled = true
+	cfg.Tools.Web.DuckDuckGo.Enabled = true
+
+	picotools.SetPreferredWebSearchLanguage("en")
+	t.Cleanup(func() {
+		picotools.SetPreferredWebSearchLanguage("")
+	})
+
+	if got := resolveCurrentWebSearchProvider(cfg); got != "duckduckgo" {
+		t.Fatalf("resolveCurrentWebSearchProvider() = %q, want duckduckgo", got)
+	}
+
+	picotools.SetPreferredWebSearchLanguage("zh")
+	if got := resolveCurrentWebSearchProvider(cfg); got != "sogou" {
+		t.Fatalf("resolveCurrentWebSearchProvider() = %q, want sogou", got)
 	}
 }

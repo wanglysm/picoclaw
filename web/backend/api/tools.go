@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/sipeed/picoclaw/pkg/config"
+	picotools "github.com/sipeed/picoclaw/pkg/tools"
 )
 
 type toolCatalogEntry struct {
@@ -640,7 +641,27 @@ func resolveCurrentWebSearchProvider(cfg *config.Config) string {
 	if selected != "" && selected != "auto" && webSearchProviderConfigured(cfg, selected) {
 		return selected
 	}
-	for _, name := range []string{"perplexity", "brave", "searxng", "tavily", "sogou", "duckduckgo", "baidu_search", "glm_search"} {
+
+	for _, name := range []string{"perplexity", "brave", "searxng", "tavily"} {
+		if webSearchProviderConfigured(cfg, name) {
+			return name
+		}
+	}
+
+	if webSearchProviderConfigured(cfg, "sogou") && webSearchProviderConfigured(cfg, "duckduckgo") {
+		if picotools.GetPreferredWebSearchLanguage() == "en" {
+			return "duckduckgo"
+		}
+		return "sogou"
+	}
+	if webSearchProviderConfigured(cfg, "sogou") {
+		return "sogou"
+	}
+	if webSearchProviderConfigured(cfg, "duckduckgo") {
+		return "duckduckgo"
+	}
+
+	for _, name := range []string{"baidu_search", "glm_search"} {
 		if webSearchProviderConfigured(cfg, name) {
 			return name
 		}
