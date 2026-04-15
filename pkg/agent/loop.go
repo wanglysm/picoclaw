@@ -326,21 +326,7 @@ func registerSharedTools(
 		find_skills_enable := cfg.Tools.IsToolEnabled("find_skills")
 		install_skills_enable := cfg.Tools.IsToolEnabled("install_skill")
 		if skills_enabled && (find_skills_enable || install_skills_enable) {
-			clawHubConfig := cfg.Tools.Skills.Registries.ClawHub
-			registryMgr := skills.NewRegistryManagerFromConfig(skills.RegistryConfig{
-				MaxConcurrentSearches: cfg.Tools.Skills.MaxConcurrentSearches,
-				ClawHub: skills.ClawHubConfig{
-					Enabled:         clawHubConfig.Enabled,
-					BaseURL:         clawHubConfig.BaseURL,
-					AuthToken:       clawHubConfig.AuthToken.String(),
-					SearchPath:      clawHubConfig.SearchPath,
-					SkillsPath:      clawHubConfig.SkillsPath,
-					DownloadPath:    clawHubConfig.DownloadPath,
-					Timeout:         clawHubConfig.Timeout,
-					MaxZipSize:      clawHubConfig.MaxZipSize,
-					MaxResponseSize: clawHubConfig.MaxResponseSize,
-				},
-			})
+			registryMgr := skills.NewRegistryManagerFromToolsConfig(cfg.Tools.Skills)
 
 			if find_skills_enable {
 				searchCache := skills.NewSearchCache(
@@ -2374,6 +2360,8 @@ turnLoop:
 		var response *providers.LLMResponse
 		var err error
 		maxRetries := 2
+		callHasMedia := messagesContainMedia(callMessages)
+		didStripMedia := false
 		for retry := 0; retry <= maxRetries; retry++ {
 			response, err = callLLM(callMessages, providerToolDefs)
 			if err == nil {
@@ -2382,6 +2370,45 @@ turnLoop:
 			if ts.hardAbortRequested() && errors.Is(err, context.Canceled) {
 				turnStatus = TurnEndStatusAborted
 				return al.abortTurn(ts)
+			}
+
+			// If the provider/model doesn't support multimodal inputs, retry once with media stripped
+			// so the session doesn't get "stuck" after a user sends an image.
+			if callHasMedia && !didStripMedia && isVisionUnsupportedError(err) {
+				didStripMedia = true
+				if !ts.opts.NoHistory {
+					history = ts.agent.Sessions.GetHistory(ts.sessionKey)
+					ts.agent.Sessions.SetHistory(ts.sessionKey, stripMessageMedia(history))
+
+					// Keep persistedMessages aligned so abort restore-point trimming remains correct.
+					ts.mu.Lock()
+					for i := range ts.persistedMessages {
+						ts.persistedMessages[i].Media = nil
+					}
+					ts.mu.Unlock()
+
+					ts.refreshRestorePointFromSession(ts.agent)
+				}
+
+				messages = stripMessageMedia(messages)
+				callMessages = stripMessageMedia(callMessages)
+				callHasMedia = false
+
+				al.emitEvent(
+					EventKindLLMRetry,
+					ts.eventMeta("runTurn", "turn.llm.retry"),
+					LLMRetryPayload{
+						Attempt:    1,
+						MaxRetries: 1,
+						Reason:     "vision_unsupported",
+						Error:      err.Error(),
+						Backoff:    0,
+					},
+				)
+				response, err = callLLM(callMessages, providerToolDefs)
+				if err == nil {
+					break
+				}
 			}
 
 			errMsg := strings.ToLower(err.Error())
