@@ -291,18 +291,17 @@ func (p *AntigravityProvider) buildRequest(
 		}
 	}
 
-	// Build tools (sanitize schemas for Gemini compatibility)
+	// Build tools
 	if len(tools) > 0 {
 		var funcDecls []antigravityFuncDecl
 		for _, t := range tools {
 			if t.Type != "function" {
 				continue
 			}
-			params := common.SanitizeSchemaForGemini(t.Function.Parameters)
 			funcDecls = append(funcDecls, antigravityFuncDecl{
 				Name:        t.Function.Name,
 				Description: t.Function.Description,
-				Parameters:  params,
+				Parameters:  t.Function.Parameters,
 			})
 		}
 		if len(funcDecls) > 0 {

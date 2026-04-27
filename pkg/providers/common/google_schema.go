@@ -16,11 +16,11 @@ var geminiSupportedTypes = map[string]bool{
 	"string":  true,
 }
 
-// SanitizeSchemaForGemini reduces a JSON Schema to the conservative subset
-// accepted by Gemini-style function declarations. It resolves local refs,
-// collapses composition keywords like anyOf/oneOf/allOf, and strips advanced
-// keywords that Gemini rejects.
-func SanitizeSchemaForGemini(schema map[string]any) map[string]any {
+// SanitizeSchemaForGoogle reduces a JSON Schema to the conservative subset
+// accepted by Google/Gemini-style function declarations. It resolves local
+// refs, collapses composition keywords like anyOf/oneOf/allOf, and strips
+// advanced keywords that Gemini-compatible backends often reject.
+func SanitizeSchemaForGoogle(schema map[string]any) map[string]any {
 	if schema == nil {
 		return nil
 	}
@@ -37,6 +37,12 @@ func SanitizeSchemaForGemini(schema map[string]any) map[string]any {
 		result["type"] = "object"
 	}
 	return result
+}
+
+// SanitizeSchemaForGemini is kept as a compatibility alias for the original
+// Google/Gemini sanitizer name.
+func SanitizeSchemaForGemini(schema map[string]any) map[string]any {
+	return SanitizeSchemaForGoogle(schema)
 }
 
 type geminiSchemaSanitizer struct {

@@ -1,10 +1,7 @@
 package oauthprovider
 
 import (
-	"reflect"
 	"testing"
-
-	providercommon "github.com/sipeed/picoclaw/pkg/providers/common"
 )
 
 func TestBuildRequestUsesFunctionFieldsWhenToolCallNameMissing(t *testing.T) {
@@ -77,7 +74,7 @@ func TestParseSSEResponse_SplitsThoughtAndVisibleContent(t *testing.T) {
 	}
 }
 
-func TestBuildRequest_SanitizesComplexToolSchemas(t *testing.T) {
+func TestBuildRequest_PreservesComplexToolSchemasByDefault(t *testing.T) {
 	p := &AntigravityProvider{}
 	schema := map[string]any{
 		"type": "object",
@@ -135,9 +132,11 @@ func TestBuildRequest_SanitizesComplexToolSchemas(t *testing.T) {
 		t.Fatalf("request tools = %#v, want one function declaration", req.Tools)
 	}
 
-	got := req.Tools[0].FunctionDeclarations[0].Parameters
-	want := providercommon.SanitizeSchemaForGemini(schema)
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("sanitized parameters mismatch\n got: %#v\nwant: %#v", got, want)
+	got, ok := req.Tools[0].FunctionDeclarations[0].Parameters.(map[string]any)
+	if !ok {
+		t.Fatalf("parameters = %#v, want map", req.Tools[0].FunctionDeclarations[0].Parameters)
+	}
+	if got["$defs"] == nil {
+		t.Fatalf("parameters = %#v, want raw schema with $defs preserved by default", got)
 	}
 }

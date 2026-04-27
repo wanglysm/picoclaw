@@ -5,11 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strings"
 	"testing"
-
-	providercommon "github.com/sipeed/picoclaw/pkg/providers/common"
 )
 
 func TestGeminiProvider_ChatSeparatesThoughtAndToolCall(t *testing.T) {
@@ -262,7 +259,7 @@ func TestGeminiProvider_ChatStreamSkipsEmptyDataFrames(t *testing.T) {
 	}
 }
 
-func TestGeminiProvider_BuildRequestBody_SanitizesComplexToolSchemas(t *testing.T) {
+func TestGeminiProvider_BuildRequestBody_PreservesComplexToolSchemasByDefault(t *testing.T) {
 	provider := NewGeminiProvider("test-key", "https://example.com/v1beta", "", "", 0, nil, nil)
 	schema := map[string]any{
 		"type": "object",
@@ -315,9 +312,8 @@ func TestGeminiProvider_BuildRequestBody_SanitizesComplexToolSchemas(t *testing.
 		t.Fatalf("parameters = %#v, want map", tools[0].FunctionDeclarations[0].Parameters)
 	}
 
-	want := providercommon.SanitizeSchemaForGemini(schema)
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("sanitized parameters mismatch\n got: %#v\nwant: %#v", got, want)
+	if got["$defs"] == nil {
+		t.Fatalf("parameters = %#v, want raw schema with $defs preserved by default", got)
 	}
 }
 
