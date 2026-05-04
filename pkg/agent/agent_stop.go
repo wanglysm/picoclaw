@@ -20,6 +20,22 @@ func (al *AgentLoop) tryHandleStopCommand(
 	}
 
 	result, err := al.stopActiveTurnForSession(sessionKey)
+
+	// This function is only called when loaded=true (another turn already
+	// claimed this session). If stopActiveTurnForSession found a pending
+	// placeholder but didn't stop it, that placeholder belongs to the other
+	// message's worker which hasn't started yet — arm a pending stop so the
+	// worker will bail when it checks before running.
+	if err == nil && !result.Stopped {
+		if ts := al.getActiveTurnState(sessionKey); ts != nil {
+			snap := ts.snapshot()
+			if strings.HasPrefix(snap.TurnID, pendingTurnPrefix) {
+				al.markPendingStop(sessionKey)
+				result.Stopped = true
+			}
+		}
+	}
+
 	reply := commands.FormatStopReply(result)
 	if err != nil {
 		reply = "Failed to stop task: " + err.Error()
@@ -53,8 +69,11 @@ func (al *AgentLoop) stopActiveTurnForSession(sessionKey string) (commands.StopR
 	result.TaskName = snap.UserMessage
 
 	if strings.HasPrefix(snap.TurnID, pendingTurnPrefix) {
-		al.markPendingStop(sessionKey)
-		result.Stopped = true
+		// A pending placeholder means this session is either idle (our own
+		// placeholder from the /stop command) or another message is queued but
+		// hasn't started yet. In both cases, we don't arm a pending stop here;
+		// the caller (tryHandleStopCommand) handles the "another message queued"
+		// case explicitly, since it knows loaded=true.
 		return result, nil
 	}
 
