@@ -61,7 +61,10 @@ func NewLINEChannel(
 		return nil, fmt.Errorf("line channel_secret and channel_access_token are required")
 	}
 
-	client, err := messaging_api.NewMessagingApiAPI(cfg.ChannelAccessToken.String())
+	client, err := messaging_api.NewMessagingApiAPI(
+		cfg.ChannelAccessToken.String(),
+		messaging_api.WithHTTPClient(&http.Client{Timeout: 30 * time.Second}),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create LINE messaging client: %w", err)
 	}
@@ -456,7 +459,7 @@ func (c *LINEChannel) Send(ctx context.Context, msg bus.OutboundMessage) ([]stri
 	if entry, ok := c.replyTokens.LoadAndDelete(msg.ChatID); ok {
 		tokenEntry := entry.(replyTokenEntry)
 		if time.Since(tokenEntry.timestamp) < lineReplyTokenMaxAge {
-			_, err := c.client.WithContext(ctx).ReplyMessage(&messaging_api.ReplyMessageRequest{
+			_, _, err := c.client.WithContext(ctx).ReplyMessageWithHttpInfo(&messaging_api.ReplyMessageRequest{
 				ReplyToken: tokenEntry.token,
 				Messages:   []messaging_api.MessageInterface{&textMsg},
 			})
@@ -467,16 +470,18 @@ func (c *LINEChannel) Send(ctx context.Context, msg bus.OutboundMessage) ([]stri
 				})
 				return nil, nil
 			}
-			logger.DebugC("line", "Reply API failed, falling back to Push API")
+			logger.DebugCF("line", "Reply API failed, falling back to Push API", map[string]any{
+				"error": err.Error(),
+			})
 		}
 	}
 
 	// Fall back to Push API
-	_, err := c.client.WithContext(ctx).PushMessage(&messaging_api.PushMessageRequest{
+	resp, _, err := c.client.WithContext(ctx).PushMessageWithHttpInfo(&messaging_api.PushMessageRequest{
 		To:       msg.ChatID,
 		Messages: []messaging_api.MessageInterface{&textMsg},
 	}, "")
-	return nil, err
+	return nil, classifySDKError(resp, err)
 }
 
 // SendMedia implements the channels.MediaSender interface.
@@ -502,11 +507,12 @@ func (c *LINEChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessag
 		}
 
 		textMsg := messaging_api.TextMessage{Text: caption}
-		if _, err := c.client.WithContext(ctx).PushMessage(&messaging_api.PushMessageRequest{
+		resp, _, err := c.client.WithContext(ctx).PushMessageWithHttpInfo(&messaging_api.PushMessageRequest{
 			To:       msg.ChatID,
 			Messages: []messaging_api.MessageInterface{&textMsg},
-		}, ""); err != nil {
-			return nil, err
+		}, "")
+		if err != nil {
+			return nil, classifySDKError(resp, err)
 		}
 	}
 
@@ -558,13 +564,24 @@ func (c *LINEChannel) StartTyping(ctx context.Context, chatID string) (func(), e
 	return stop, nil
 }
 
+// classifySDKError maps an SDK HTTP response to the project's sentinel errors.
+func classifySDKError(resp *http.Response, err error) error {
+	if err == nil {
+		return nil
+	}
+	if resp != nil {
+		return channels.ClassifySendError(resp.StatusCode, err)
+	}
+	return channels.ClassifyNetError(err)
+}
+
 // sendLoading sends a loading animation indicator to the chat.
 func (c *LINEChannel) sendLoading(ctx context.Context, chatID string) error {
-	_, err := c.client.WithContext(ctx).ShowLoadingAnimation(&messaging_api.ShowLoadingAnimationRequest{
+	resp, _, err := c.client.WithContext(ctx).ShowLoadingAnimationWithHttpInfo(&messaging_api.ShowLoadingAnimationRequest{
 		ChatId:         chatID,
 		LoadingSeconds: 60,
 	})
-	return err
+	return classifySDKError(resp, err)
 }
 
 // downloadContent downloads media content from the LINE content API.
