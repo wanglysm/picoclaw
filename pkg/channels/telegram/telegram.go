@@ -1060,7 +1060,10 @@ func (c *TelegramChannel) collectTelegramMessageParts(
 	if msg.Voice != nil {
 		voicePath := c.downloadFile(ctx, msg.Voice.FileID, ".ogg")
 		if voicePath != "" {
-			parts.mediaPaths = append(parts.mediaPaths, storeMedia(voicePath, indexedMediaFilename("voice", ".ogg", index, total)))
+			parts.mediaPaths = append(
+				parts.mediaPaths,
+				storeMedia(voicePath, indexedMediaFilename("voice", ".ogg", index, total)),
+			)
 			parts.content = append(parts.content, "[voice]")
 		}
 	}
