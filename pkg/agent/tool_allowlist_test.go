@@ -1,10 +1,31 @@
 package agent
 
 import (
+	"context"
 	"testing"
 
 	"github.com/sipeed/picoclaw/pkg/config"
+	agenttools "github.com/sipeed/picoclaw/pkg/tools"
 )
+
+type allowlistTestTool struct {
+	name string
+}
+
+func (t *allowlistTestTool) Name() string { return t.name }
+
+func (t *allowlistTestTool) Description() string { return "test tool" }
+
+func (t *allowlistTestTool) Parameters() map[string]any {
+	return map[string]any{"type": "object"}
+}
+
+func (t *allowlistTestTool) Execute(
+	_ context.Context,
+	_ map[string]any,
+) *agenttools.ToolResult {
+	return agenttools.NewToolResult("ok")
+}
 
 func TestUnknownAgentToolNames(t *testing.T) {
 	workspace := setupWorkspace(t, map[string]string{
@@ -16,18 +37,34 @@ tools: [read_file, web_serach, mcp_github_search]
 	})
 	defer cleanupWorkspace(t, workspace)
 
-	cfg := &config.Config{
-		Tools: config.ToolsConfig{
-			ReadFile: config.ReadFileToolConfig{Enabled: true},
-			Web: config.WebToolsConfig{
-				ToolConfig: config.ToolConfig{Enabled: true},
-			},
-		},
-	}
+	registry := agenttools.NewToolRegistry()
+	registry.Register(&allowlistTestTool{name: "read_file"})
+	registry.Register(&allowlistTestTool{name: "web_search"})
 
-	unknown := unknownAgentToolNames(cfg, loadAgentDefinition(workspace))
+	unknown := unknownAgentToolNames(registry, loadAgentDefinition(workspace))
 	if len(unknown) != 1 || unknown[0] != "web_serach" {
 		t.Fatalf("unknownAgentToolNames() = %v, want [web_serach]", unknown)
+	}
+}
+
+func TestUnknownAgentToolNamesUsesRegisteredRuntimeTools(t *testing.T) {
+	workspace := setupWorkspace(t, map[string]string{
+		"AGENT.md": `---
+tools: [serial, reaction, send_tts, load_image, delegate, made_up]
+---
+# Agent
+`,
+	})
+	defer cleanupWorkspace(t, workspace)
+
+	registry := agenttools.NewToolRegistry()
+	for _, name := range []string{"serial", "reaction", "send_tts", "load_image", "delegate"} {
+		registry.Register(&allowlistTestTool{name: name})
+	}
+
+	unknown := unknownAgentToolNames(registry, loadAgentDefinition(workspace))
+	if len(unknown) != 1 || unknown[0] != "made_up" {
+		t.Fatalf("unknownAgentToolNames() = %v, want [made_up]", unknown)
 	}
 }
 

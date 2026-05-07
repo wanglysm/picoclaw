@@ -6,26 +6,37 @@ import (
 
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/logger"
+	"github.com/sipeed/picoclaw/pkg/tools"
 )
 
 const dynamicMCPToolPrefix = "mcp_"
 
-func warnOnUnknownAgentDeclarations(
+func warnOnUnknownAgentToolDeclarations(
+	agentID, workspace string,
+	definition AgentContextDefinition,
+	registry *tools.ToolRegistry,
+) {
+	if registry == nil || frontmatterParseFailed(definition) {
+		return
+	}
+
+	if unknownTools := unknownAgentToolNames(registry, definition); len(unknownTools) > 0 {
+		logger.WarnCF("agent", "AGENT.md declares unregistered tool names",
+			map[string]any{
+				"agent_id":  agentID,
+				"workspace": workspace,
+				"tools":     unknownTools,
+			})
+	}
+}
+
+func warnOnUnknownAgentMCPServerDeclarations(
 	agentID, workspace string,
 	cfg *config.Config,
 	definition AgentContextDefinition,
 ) {
 	if cfg == nil || frontmatterParseFailed(definition) {
 		return
-	}
-
-	if unknownTools := unknownAgentToolNames(cfg, definition); len(unknownTools) > 0 {
-		logger.WarnCF("agent", "AGENT.md declares unknown tool names",
-			map[string]any{
-				"agent_id":  agentID,
-				"workspace": workspace,
-				"tools":     unknownTools,
-			})
 	}
 
 	if unknownServers := unknownAgentMCPServerNames(cfg, definition); len(unknownServers) > 0 {
@@ -38,12 +49,15 @@ func warnOnUnknownAgentDeclarations(
 	}
 }
 
-func unknownAgentToolNames(cfg *config.Config, definition AgentContextDefinition) []string {
+func unknownAgentToolNames(
+	registry *tools.ToolRegistry,
+	definition AgentContextDefinition,
+) []string {
 	if definition.Agent == nil || definition.Agent.Frontmatter.Tools == nil {
 		return nil
 	}
 
-	known := knownRuntimeToolNames(cfg)
+	known := registeredRuntimeToolNames(registry)
 	unknown := make(map[string]struct{})
 	for _, raw := range definition.Agent.Frontmatter.Tools {
 		name := strings.ToLower(strings.TrimSpace(raw))
@@ -57,6 +71,21 @@ func unknownAgentToolNames(cfg *config.Config, definition AgentContextDefinition
 	}
 
 	return sortedKeys(unknown)
+}
+
+func registeredRuntimeToolNames(registry *tools.ToolRegistry) map[string]struct{} {
+	known := make(map[string]struct{})
+	if registry == nil {
+		return known
+	}
+	for _, raw := range registry.List() {
+		name := strings.ToLower(strings.TrimSpace(raw))
+		if name == "" {
+			continue
+		}
+		known[name] = struct{}{}
+	}
+	return known
 }
 
 func unknownAgentMCPServerNames(cfg *config.Config, definition AgentContextDefinition) []string {
@@ -77,55 +106,6 @@ func unknownAgentMCPServerNames(cfg *config.Config, definition AgentContextDefin
 	}
 
 	return sortedKeys(unknown)
-}
-
-func knownRuntimeToolNames(cfg *config.Config) map[string]struct{} {
-	known := make(map[string]struct{})
-	if cfg == nil {
-		return known
-	}
-
-	addKnownToolIfEnabled(known, cfg.Tools.IsToolEnabled("read_file"), "read_file")
-	addKnownToolIfEnabled(known, cfg.Tools.IsToolEnabled("write_file"), "write_file")
-	addKnownToolIfEnabled(known, cfg.Tools.IsToolEnabled("list_dir"), "list_dir")
-	addKnownToolIfEnabled(known, cfg.Tools.IsToolEnabled("exec"), "exec")
-	addKnownToolIfEnabled(known, cfg.Tools.IsToolEnabled("edit_file"), "edit_file")
-	addKnownToolIfEnabled(known, cfg.Tools.IsToolEnabled("append_file"), "append_file")
-	addKnownToolIfEnabled(known, cfg.Tools.IsToolEnabled("cron"), "cron")
-	addKnownToolIfEnabled(known, cfg.Tools.IsToolEnabled("web"), "web_search")
-	addKnownToolIfEnabled(known, cfg.Tools.IsToolEnabled("web_fetch"), "web_fetch")
-	addKnownToolIfEnabled(known, cfg.Tools.IsToolEnabled("i2c"), "i2c")
-	addKnownToolIfEnabled(known, cfg.Tools.IsToolEnabled("spi"), "spi")
-	addKnownToolIfEnabled(known, cfg.Tools.IsToolEnabled("message"), "message")
-	addKnownToolIfEnabled(known, cfg.Tools.IsToolEnabled("send_file"), "send_file")
-	addKnownToolIfEnabled(
-		known,
-		cfg.Tools.IsToolEnabled("skills") && cfg.Tools.IsToolEnabled("find_skills"),
-		"find_skills",
-	)
-	addKnownToolIfEnabled(
-		known,
-		cfg.Tools.IsToolEnabled("skills") && cfg.Tools.IsToolEnabled("install_skill"),
-		"install_skill",
-	)
-	if cfg.Tools.IsToolEnabled("subagent") {
-		addKnownToolIfEnabled(known, cfg.Tools.IsToolEnabled("spawn"), "spawn")
-		addKnownToolIfEnabled(known, cfg.Tools.IsToolEnabled("subagent"), "subagent")
-		addKnownToolIfEnabled(known, cfg.Tools.IsToolEnabled("spawn_status"), "spawn_status")
-	}
-	if cfg.Tools.IsToolEnabled("mcp") && cfg.Tools.MCP.Discovery.Enabled {
-		addKnownToolIfEnabled(known, cfg.Tools.MCP.Discovery.UseRegex, "tool_search_tool_regex")
-		addKnownToolIfEnabled(known, cfg.Tools.MCP.Discovery.UseBM25, "tool_search_tool_bm25")
-	}
-
-	return known
-}
-
-func addKnownToolIfEnabled(known map[string]struct{}, enabled bool, name string) {
-	if !enabled {
-		return
-	}
-	known[name] = struct{}{}
 }
 
 func sortedKeys(values map[string]struct{}) []string {

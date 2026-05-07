@@ -38,6 +38,7 @@ type AgentInstance struct {
 	Sessions                  session.SessionStore
 	ContextBuilder            *ContextBuilder
 	Tools                     *tools.ToolRegistry
+	Definition                AgentContextDefinition
 	Subagents                 *config.SubagentsConfig
 	SkillsFilter              []string
 	MCPServerAllowlist        map[string]struct{}
@@ -149,7 +150,7 @@ func NewAgentInstance(
 		subagents = agentCfg.Subagents
 		skillsFilter = resolveAgentSkillsFilter(agentCfg, definition)
 	}
-	warnOnUnknownAgentDeclarations(agentID, workspace, cfg, definition)
+	warnOnUnknownAgentMCPServerDeclarations(agentID, workspace, cfg, definition)
 
 	maxIter := defaults.MaxToolIterations
 	if maxIter == 0 {
@@ -256,6 +257,7 @@ func NewAgentInstance(
 		Sessions:                  sessions,
 		ContextBuilder:            contextBuilder,
 		Tools:                     toolsRegistry,
+		Definition:                definition,
 		Subagents:                 subagents,
 		SkillsFilter:              skillsFilter,
 		MCPServerAllowlist:        agentMCPServerAllowlist,
