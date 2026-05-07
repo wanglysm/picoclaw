@@ -56,7 +56,8 @@ type qqAPI interface {
 
 type QQChannel struct {
 	*channels.BaseChannel
-	config         config.QQConfig
+	bc             *config.Channel
+	config         *config.QQSettings
 	api            qqAPI
 	tokenSource    oauth2.TokenSource
 	ctx            context.Context
@@ -82,15 +83,16 @@ type QQChannel struct {
 	stopOnce sync.Once
 }
 
-func NewQQChannel(cfg config.QQConfig, messageBus *bus.MessageBus) (*QQChannel, error) {
-	base := channels.NewBaseChannel("qq", cfg, messageBus, cfg.AllowFrom,
+func NewQQChannel(bc *config.Channel, cfg *config.QQSettings, messageBus *bus.MessageBus) (*QQChannel, error) {
+	base := channels.NewBaseChannel("qq", cfg, messageBus, bc.AllowFrom,
 		channels.WithMaxMessageLength(cfg.MaxMessageLength),
-		channels.WithGroupTrigger(cfg.GroupTrigger),
-		channels.WithReasoningChannelID(cfg.ReasoningChannelID),
+		channels.WithGroupTrigger(bc.GroupTrigger),
+		channels.WithReasoningChannelID(bc.ReasoningChannelID),
 	)
 
 	return &QQChannel{
 		BaseChannel: base,
+		bc:          bc,
 		config:      cfg,
 		dedup:       make(map[string]time.Time),
 		done:        make(chan struct{}),
@@ -161,8 +163,8 @@ func (c *QQChannel) Start(ctx context.Context) error {
 
 	// Pre-register reasoning_channel_id as group chat if configured,
 	// so outbound-only destinations are routed correctly.
-	if c.config.ReasoningChannelID != "" {
-		c.chatType.Store(c.config.ReasoningChannelID, "group")
+	if c.bc.ReasoningChannelID != "" {
+		c.chatType.Store(c.bc.ReasoningChannelID, "group")
 	}
 
 	c.SetRunning(true)
@@ -200,9 +202,9 @@ func (c *QQChannel) getChatKind(chatID string) string {
 	return "group"
 }
 
-func (c *QQChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {
+func (c *QQChannel) Send(ctx context.Context, msg bus.OutboundMessage) ([]string, error) {
 	if !c.IsRunning() {
-		return channels.ErrNotRunning
+		return nil, channels.ErrNotRunning
 	}
 
 	chatKind := c.getChatKind(msg.ChatID)
@@ -236,11 +238,14 @@ func (c *QQChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 	}
 
 	// Route to group or C2C.
-	var err error
+	var (
+		sentMsg *dto.Message
+		err     error
+	)
 	if chatKind == "group" {
-		_, err = c.api.PostGroupMessage(ctx, msg.ChatID, msgToCreate)
+		sentMsg, err = c.api.PostGroupMessage(ctx, msg.ChatID, msgToCreate)
 	} else {
-		_, err = c.api.PostC2CMessage(ctx, msg.ChatID, msgToCreate)
+		sentMsg, err = c.api.PostC2CMessage(ctx, msg.ChatID, msgToCreate)
 	}
 
 	if err != nil {
@@ -249,10 +254,13 @@ func (c *QQChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 			"chat_kind": chatKind,
 			"error":     err.Error(),
 		})
-		return fmt.Errorf("qq send: %w", channels.ErrTemporary)
+		return nil, fmt.Errorf("qq send: %w", channels.ErrTemporary)
 	}
 
-	return nil
+	if sentMsg == nil {
+		return nil, nil
+	}
+	return []string{sentMsg.ID}, nil
 }
 
 // StartTyping implements channels.TypingCapable.
@@ -319,13 +327,14 @@ func (c *QQChannel) StartTyping(ctx context.Context, chatID string) (func(), err
 // QQ group/C2C media sending is a two-step flow:
 // 1. Upload media to /files using a remote URL or base64-encoded local bytes.
 // 2. Send a msg_type=7 message using the returned file_info.
-func (c *QQChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage) error {
+func (c *QQChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage) ([]string, error) {
 	if !c.IsRunning() {
-		return channels.ErrNotRunning
+		return nil, channels.ErrNotRunning
 	}
 
 	chatKind := c.getChatKind(msg.ChatID)
 
+	var messageIDs []string
 	for _, part := range msg.Parts {
 		fileInfo, err := c.uploadMedia(ctx, chatKind, msg.ChatID, part)
 		if err != nil {
@@ -335,22 +344,26 @@ func (c *QQChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage)
 				"error":   err.Error(),
 			})
 			if errors.Is(err, channels.ErrSendFailed) {
-				return err
+				return nil, err
 			}
-			return fmt.Errorf("qq send media: %w", channels.ErrTemporary)
+			return nil, fmt.Errorf("qq send media: %w", channels.ErrTemporary)
 		}
 
-		if err := c.sendUploadedMedia(ctx, chatKind, msg.ChatID, part, fileInfo); err != nil {
+		sentMsg, err := c.sendUploadedMedia(ctx, chatKind, msg.ChatID, part, fileInfo)
+		if err != nil {
 			logger.ErrorCF("qq", "Failed to send media", map[string]any{
 				"type":    part.Type,
 				"chat_id": msg.ChatID,
 				"error":   err.Error(),
 			})
-			return fmt.Errorf("qq send media: %w", channels.ErrTemporary)
+			return nil, fmt.Errorf("qq send media: %w", channels.ErrTemporary)
+		}
+		if sentMsg != nil && sentMsg.ID != "" {
+			messageIDs = append(messageIDs, sentMsg.ID)
 		}
 	}
 
-	return nil
+	return messageIDs, nil
 }
 
 type qqMediaUpload struct {
@@ -517,7 +530,7 @@ func (c *QQChannel) sendUploadedMedia(
 	chatKind, chatID string,
 	part bus.MediaPart,
 	fileInfo []byte,
-) error {
+) (*dto.Message, error) {
 	msg := &dto.MessageToCreate{
 		Content: part.Caption,
 		MsgType: dto.RichMediaMsg,
@@ -532,11 +545,11 @@ func (c *QQChannel) sendUploadedMedia(
 	}
 
 	if chatKind == "group" {
-		_, err := c.api.PostGroupMessage(ctx, chatID, msg)
-		return err
+		sentMsg, err := c.api.PostGroupMessage(ctx, chatID, msg)
+		return sentMsg, err
 	}
-	_, err := c.api.PostC2CMessage(ctx, chatID, msg)
-	return err
+	sentMsg, err := c.api.PostC2CMessage(ctx, chatID, msg)
+	return sentMsg, err
 }
 
 func (c *QQChannel) applyPassiveReplyMetadata(chatID string, msg *dto.MessageToCreate) {
@@ -577,10 +590,20 @@ func qqFileType(partType string) uint64 {
 }
 
 func (c *QQChannel) maxBase64FileSizeBytes() int64 {
+	if c.config == nil {
+		return 0
+	}
 	if c.config.MaxBase64FileSizeMiB <= 0 {
 		return 0
 	}
 	return c.config.MaxBase64FileSizeMiB * bytesPerMiB
+}
+
+func (c *QQChannel) accountID() string {
+	if c.config == nil {
+		return ""
+	}
+	return c.config.AppID
 }
 
 // handleC2CMessage handles QQ private messages.
@@ -636,17 +659,17 @@ func (c *QQChannel) handleC2CMessage() event.C2CMessageEventHandler {
 		metadata := map[string]string{
 			"account_id": senderID,
 		}
+		inboundCtx := bus.InboundContext{
+			Channel:   c.Name(),
+			Account:   c.accountID(),
+			ChatID:    senderID,
+			ChatType:  "direct",
+			SenderID:  senderID,
+			MessageID: data.ID,
+			Raw:       metadata,
+		}
 
-		c.HandleMessage(c.ctx,
-			bus.Peer{Kind: "direct", ID: senderID},
-			data.ID,
-			senderID,
-			senderID,
-			content,
-			mediaPaths,
-			metadata,
-			sender,
-		)
+		c.HandleInboundContext(c.ctx, senderID, content, mediaPaths, inboundCtx, sender)
 
 		return nil
 	}
@@ -714,17 +737,18 @@ func (c *QQChannel) handleGroupATMessage() event.GroupATMessageEventHandler {
 			"account_id": senderID,
 			"group_id":   data.GroupID,
 		}
+		inboundCtx := bus.InboundContext{
+			Channel:   c.Name(),
+			Account:   c.accountID(),
+			ChatID:    data.GroupID,
+			ChatType:  "group",
+			SenderID:  senderID,
+			MessageID: data.ID,
+			Mentioned: true,
+			Raw:       metadata,
+		}
 
-		c.HandleMessage(c.ctx,
-			bus.Peer{Kind: "group", ID: data.GroupID},
-			data.ID,
-			senderID,
-			data.GroupID,
-			content,
-			mediaPaths,
-			metadata,
-			sender,
-		)
+		c.HandleInboundContext(c.ctx, data.GroupID, content, mediaPaths, inboundCtx, sender)
 
 		return nil
 	}
@@ -990,4 +1014,9 @@ func sanitizeURLs(text string) string {
 
 		return scheme + domain + path
 	})
+}
+
+// VoiceCapabilities returns the voice capabilities of the channel.
+func (c *QQChannel) VoiceCapabilities() channels.VoiceCapabilities {
+	return channels.VoiceCapabilities{ASR: true, TTS: true}
 }

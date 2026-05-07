@@ -25,7 +25,7 @@ import (
 // It uses WebSocket for receiving messages via stream mode and API for sending
 type DingTalkChannel struct {
 	*channels.BaseChannel
-	config       config.DingTalkConfig
+	config       *config.DingTalkSettings
 	clientID     string
 	clientSecret string
 	streamClient *client.StreamClient
@@ -36,7 +36,11 @@ type DingTalkChannel struct {
 }
 
 // NewDingTalkChannel creates a new DingTalk channel instance
-func NewDingTalkChannel(cfg config.DingTalkConfig, messageBus *bus.MessageBus) (*DingTalkChannel, error) {
+func NewDingTalkChannel(
+	bc *config.Channel,
+	cfg *config.DingTalkSettings,
+	messageBus *bus.MessageBus,
+) (*DingTalkChannel, error) {
 	if cfg.ClientID == "" || cfg.ClientSecret.String() == "" {
 		return nil, fmt.Errorf("dingtalk client_id and client_secret are required")
 	}
@@ -44,10 +48,10 @@ func NewDingTalkChannel(cfg config.DingTalkConfig, messageBus *bus.MessageBus) (
 	// Set the logger for the Stream SDK
 	dinglog.SetLogger(logger.NewLogger("dingtalk"))
 
-	base := channels.NewBaseChannel("dingtalk", cfg, messageBus, cfg.AllowFrom,
+	base := channels.NewBaseChannel("dingtalk", cfg, messageBus, bc.AllowFrom,
 		channels.WithMaxMessageLength(20000),
-		channels.WithGroupTrigger(cfg.GroupTrigger),
-		channels.WithReasoningChannelID(cfg.ReasoningChannelID),
+		channels.WithGroupTrigger(bc.GroupTrigger),
+		channels.WithReasoningChannelID(bc.ReasoningChannelID),
 	)
 
 	return &DingTalkChannel{
@@ -104,20 +108,20 @@ func (c *DingTalkChannel) Stop(ctx context.Context) error {
 }
 
 // Send sends a message to DingTalk via the chatbot reply API
-func (c *DingTalkChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {
+func (c *DingTalkChannel) Send(ctx context.Context, msg bus.OutboundMessage) ([]string, error) {
 	if !c.IsRunning() {
-		return channels.ErrNotRunning
+		return nil, channels.ErrNotRunning
 	}
 
 	// Get session webhook from storage
 	sessionWebhookRaw, ok := c.sessionWebhooks.Load(msg.ChatID)
 	if !ok {
-		return fmt.Errorf("no session_webhook found for chat %s, cannot send message", msg.ChatID)
+		return nil, fmt.Errorf("no session_webhook found for chat %s, cannot send message", msg.ChatID)
 	}
 
 	sessionWebhook, ok := sessionWebhookRaw.(string)
 	if !ok {
-		return fmt.Errorf("invalid session_webhook type for chat %s", msg.ChatID)
+		return nil, fmt.Errorf("invalid session_webhook type for chat %s", msg.ChatID)
 	}
 
 	logger.DebugCF("dingtalk", "Sending message", map[string]any{
@@ -126,7 +130,7 @@ func (c *DingTalkChannel) Send(ctx context.Context, msg bus.OutboundMessage) err
 	})
 
 	// Use the session webhook to send the reply
-	return c.SendDirectReply(ctx, sessionWebhook, msg.Content)
+	return nil, c.SendDirectReply(ctx, sessionWebhook, msg.Content)
 }
 
 // onChatBotMessageReceived implements the IChatBotMessageHandler function signature
@@ -181,16 +185,15 @@ func (c *DingTalkChannel) onChatBotMessageReceived(
 		"session_webhook":   data.SessionWebhook,
 	}
 
-	var peer bus.Peer
+	var (
+		chatType    string
+		isMentioned bool
+	)
 	if data.ConversationType == "1" {
-		peerID := senderID
-		if peerID == "" {
-			peerID = chatID
-		}
-		peer = bus.Peer{Kind: "direct", ID: peerID}
+		chatType = "direct"
 	} else {
-		peer = bus.Peer{Kind: "group", ID: data.ConversationId}
-		isMentioned := data.IsInAtList
+		chatType = "group"
+		isMentioned = data.IsInAtList
 		if isMentioned {
 			content = stripLeadingAtMentions(content)
 		}
@@ -228,8 +231,21 @@ func (c *DingTalkChannel) onChatBotMessageReceived(
 		return nil, nil
 	}
 
-	// Handle the message through the base channel
-	c.HandleMessage(ctx, peer, "", resolvedSenderID, chatID, content, nil, metadata, sender)
+	inboundCtx := bus.InboundContext{
+		Channel:   "dingtalk",
+		ChatID:    chatID,
+		ChatType:  chatType,
+		SenderID:  resolvedSenderID,
+		Mentioned: isMentioned,
+		Raw:       metadata,
+	}
+	if data.SessionWebhook != "" {
+		inboundCtx.ReplyHandles = map[string]string{
+			"session_webhook": data.SessionWebhook,
+		}
+	}
+
+	c.HandleInboundContext(ctx, chatID, content, nil, inboundCtx, sender)
 
 	// Return nil to indicate we've handled the message asynchronously
 	// The response will be sent through the message bus

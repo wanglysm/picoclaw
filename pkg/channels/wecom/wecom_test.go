@@ -50,11 +50,11 @@ func TestDispatchIncoming_UsesActualChatIDAndStoresReqIDRoute(t *testing.T) {
 		if inbound.MessageID != "msg-1" {
 			t.Fatalf("inbound MessageID = %q, want msg-1", inbound.MessageID)
 		}
-		if inbound.Peer.ID != "chat-1" {
-			t.Fatalf("inbound Peer.ID = %q, want chat-1", inbound.Peer.ID)
+		if inbound.Context.ChatType != "direct" {
+			t.Fatalf("inbound Context.ChatType = %q, want direct", inbound.Context.ChatType)
 		}
-		if inbound.Metadata["req_id"] != "req-1" {
-			t.Fatalf("inbound req_id = %q, want req-1", inbound.Metadata["req_id"])
+		if inbound.Context.ReplyHandles["req_id"] != "req-1" {
+			t.Fatalf("inbound req_id = %q, want req-1", inbound.Context.ReplyHandles["req_id"])
 		}
 	default:
 		t.Fatal("expected inbound message to be published")
@@ -190,7 +190,7 @@ func TestSend_StreamFailureFallsBackToActualChatID(t *testing.T) {
 		return wecomTestAck(nil), nil
 	}
 
-	if err := ch.Send(context.Background(), bus.OutboundMessage{
+	if _, err := ch.Send(context.Background(), bus.OutboundMessage{
 		Channel: "wecom",
 		ChatID:  "chat-1",
 		Content: "hello",
@@ -247,7 +247,7 @@ func TestSend_DoesNotSplitStreamReply(t *testing.T) {
 	}
 
 	content := strings.Repeat("\u4e2d", 30000)
-	if err := ch.Send(context.Background(), bus.OutboundMessage{
+	if _, err := ch.Send(context.Background(), bus.OutboundMessage{
 		Channel: "wecom",
 		ChatID:  "chat-1",
 		Content: content,
@@ -283,7 +283,7 @@ func TestSend_DoesNotSplitActivePush(t *testing.T) {
 	}
 
 	content := strings.Repeat("a", 30000)
-	if err := ch.Send(context.Background(), bus.OutboundMessage{
+	if _, err := ch.Send(context.Background(), bus.OutboundMessage{
 		Channel: "wecom",
 		ChatID:  "chat-1",
 		Content: content,
@@ -346,7 +346,7 @@ func TestSendMedia_SendsActiveImage(t *testing.T) {
 		}
 	}
 
-	err = ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+	_, err = ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
 		Channel: "wecom",
 		ChatID:  "chat-1",
 		Parts: []bus.MediaPart{{
@@ -457,7 +457,7 @@ func TestSendMedia_UsesTurnImageAndFinishesStream(t *testing.T) {
 		}
 	}
 
-	err = ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+	_, err = ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
 		Channel: "wecom",
 		ChatID:  "chat-1",
 		Parts: []bus.MediaPart{{
@@ -553,7 +553,7 @@ func TestSendMedia_SendsActiveFile(t *testing.T) {
 		}
 	}
 
-	err = ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+	_, err = ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
 		Channel: "wecom",
 		ChatID:  "chat-2",
 		Parts: []bus.MediaPart{{
@@ -605,9 +605,10 @@ func TestSendMedia_SendsActiveFile(t *testing.T) {
 func newTestWeComChannel(t *testing.T, messageBus *bus.MessageBus) *WeComChannel {
 	t.Helper()
 
-	cfg := config.WeComConfig{BotID: "bot-1"}
+	cfg := &config.WeComSettings{BotID: "bot-1"}
 	cfg.SetSecret("secret-1")
-	ch, err := NewChannel(cfg, messageBus)
+	bc := &config.Channel{Type: config.ChannelWeCom, Enabled: true}
+	ch, err := NewChannel(bc, cfg, messageBus)
 	if err != nil {
 		t.Fatalf("NewChannel() error = %v", err)
 	}

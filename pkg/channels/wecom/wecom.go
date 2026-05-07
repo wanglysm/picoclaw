@@ -34,7 +34,7 @@ const (
 
 type WeComChannel struct {
 	*channels.BaseChannel
-	config config.WeComConfig
+	config *config.WeComSettings
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -108,7 +108,7 @@ func (s *recentMessageSet) Mark(id string) bool {
 	return true
 }
 
-func NewChannel(cfg config.WeComConfig, messageBus *bus.MessageBus) (*WeComChannel, error) {
+func NewChannel(bc *config.Channel, cfg *config.WeComSettings, messageBus *bus.MessageBus) (*WeComChannel, error) {
 	if cfg.BotID == "" || cfg.Secret.String() == "" {
 		return nil, fmt.Errorf("wecom bot_id and secret are required")
 	}
@@ -120,8 +120,8 @@ func NewChannel(cfg config.WeComConfig, messageBus *bus.MessageBus) (*WeComChann
 		"wecom",
 		cfg,
 		messageBus,
-		cfg.AllowFrom,
-		channels.WithReasoningChannelID(cfg.ReasoningChannelID),
+		bc.AllowFrom,
+		channels.WithReasoningChannelID(bc.ReasoningChannelID),
 	)
 
 	ch := &WeComChannel{
@@ -184,20 +184,20 @@ func (c *WeComChannel) BeginStream(_ context.Context, chatID string) (channels.S
 	}, nil
 }
 
-func (c *WeComChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {
+func (c *WeComChannel) Send(ctx context.Context, msg bus.OutboundMessage) ([]string, error) {
 	if !c.IsRunning() {
-		return channels.ErrNotRunning
+		return nil, channels.ErrNotRunning
 	}
 	content := strings.TrimSpace(msg.Content)
 	if content == "" {
-		return nil
+		return nil, nil
 	}
 
 	if turn, ok := c.getTurn(msg.ChatID); ok {
 		if time.Since(turn.CreatedAt) <= wecomStreamMaxDuration {
 			if err := c.sendStreamReply(turn, content); err == nil {
 				c.consumeTurn(msg.ChatID, turn)
-				return nil
+				return nil, nil
 			}
 		}
 		c.consumeTurn(msg.ChatID, turn)
@@ -205,20 +205,20 @@ func (c *WeComChannel) Send(ctx context.Context, msg bus.OutboundMessage) error 
 
 	if route, ok := c.routes.Get(msg.ChatID); ok {
 		if err := c.sendActivePush(route.ChatID, route.ChatType, content); err != nil {
-			return err
+			return nil, err
 		}
-		return nil
+		return nil, nil
 	}
 
 	if err := c.sendActivePush(msg.ChatID, 0, content); err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return nil, nil
 }
 
-func (c *WeComChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage) error {
+func (c *WeComChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage) ([]string, error) {
 	if !c.IsRunning() {
-		return channels.ErrNotRunning
+		return nil, channels.ErrNotRunning
 	}
 
 	route, chatType, hasTurn := c.resolveMediaRoute(msg.ChatID)
@@ -231,7 +231,7 @@ func (c *WeComChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessa
 		if strings.TrimSpace(part.Ref) == "" {
 			if caption := strings.TrimSpace(part.Caption); caption != "" {
 				if err := c.sendActivePush(chatID, chatType, caption); err != nil {
-					return err
+					return nil, err
 				}
 			}
 			continue
@@ -239,7 +239,7 @@ func (c *WeComChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessa
 
 		localPath, filename, contentType, cleanup, err := c.resolveOutboundPart(ctx, part)
 		if err != nil {
-			return fmt.Errorf("wecom resolve media %q: %v: %w", part.Ref, err, channels.ErrSendFailed)
+			return nil, fmt.Errorf("wecom resolve media %q: %v: %w", part.Ref, err, channels.ErrSendFailed)
 		}
 
 		func() {
@@ -283,11 +283,11 @@ func (c *WeComChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessa
 			}
 		}()
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
-	return nil
+	return nil, nil
 }
 
 func (c *WeComChannel) connectLoop() {
@@ -570,7 +570,6 @@ func (c *WeComChannel) dispatchIncoming(reqID string, msg wecomIncomingMessage) 
 		return err
 	}
 
-	peer := bus.Peer{Kind: peerKind, ID: actualChatID}
 	metadata := map[string]string{
 		"channel":   "wecom",
 		"req_id":    reqID,
@@ -583,7 +582,20 @@ func (c *WeComChannel) dispatchIncoming(reqID string, msg wecomIncomingMessage) 
 		metadata["quote_text"] = quoteText
 	}
 
-	c.HandleMessage(c.ctx, peer, msg.MsgID, senderID, actualChatID, content, mediaRefs, metadata, sender)
+	inboundCtx := bus.InboundContext{
+		Channel:   c.Name(),
+		Account:   strings.TrimSpace(msg.AIBotID),
+		ChatID:    actualChatID,
+		ChatType:  peerKind,
+		SenderID:  senderID,
+		MessageID: msg.MsgID,
+		ReplyHandles: map[string]string{
+			"req_id": reqID,
+		},
+		Raw: metadata,
+	}
+
+	c.HandleInboundContext(c.ctx, actualChatID, content, mediaRefs, inboundCtx, sender)
 	return nil
 }
 

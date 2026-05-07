@@ -3,15 +3,20 @@ package gateway
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/sipeed/picoclaw/pkg/agent"
+	"github.com/sipeed/picoclaw/pkg/audio/asr"
+	"github.com/sipeed/picoclaw/pkg/audio/tts"
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/channels"
 	_ "github.com/sipeed/picoclaw/pkg/channels/dingtalk"
@@ -24,7 +29,9 @@ import (
 	_ "github.com/sipeed/picoclaw/pkg/channels/pico"
 	_ "github.com/sipeed/picoclaw/pkg/channels/qq"
 	_ "github.com/sipeed/picoclaw/pkg/channels/slack"
+	_ "github.com/sipeed/picoclaw/pkg/channels/teams_webhook"
 	_ "github.com/sipeed/picoclaw/pkg/channels/telegram"
+	_ "github.com/sipeed/picoclaw/pkg/channels/vk"
 	_ "github.com/sipeed/picoclaw/pkg/channels/wecom"
 	_ "github.com/sipeed/picoclaw/pkg/channels/weixin"
 	_ "github.com/sipeed/picoclaw/pkg/channels/whatsapp"
@@ -32,14 +39,16 @@ import (
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/cron"
 	"github.com/sipeed/picoclaw/pkg/devices"
+	runtimeevents "github.com/sipeed/picoclaw/pkg/events"
 	"github.com/sipeed/picoclaw/pkg/health"
 	"github.com/sipeed/picoclaw/pkg/heartbeat"
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/media"
+	"github.com/sipeed/picoclaw/pkg/netbind"
+	"github.com/sipeed/picoclaw/pkg/pid"
 	"github.com/sipeed/picoclaw/pkg/providers"
 	"github.com/sipeed/picoclaw/pkg/state"
 	"github.com/sipeed/picoclaw/pkg/tools"
-	"github.com/sipeed/picoclaw/pkg/voice"
 )
 
 const (
@@ -59,12 +68,35 @@ type services struct {
 	ChannelManager   *channels.Manager
 	DeviceService    *devices.Service
 	HealthServer     *health.Server
+	VoiceAgentCancel context.CancelFunc
 	manualReloadChan chan struct{}
 	reloading        atomic.Bool
+	authToken        string
 }
 
 type startupBlockedProvider struct {
 	reason string
+}
+
+func logChannelVoiceCapabilities(cm *channels.Manager, asrAvailable bool, ttsAvailable bool) {
+	if cm == nil {
+		return
+	}
+
+	names := cm.GetEnabledChannels()
+	sort.Strings(names)
+	for _, name := range names {
+		ch, ok := cm.GetChannel(name)
+		if !ok {
+			continue
+		}
+		caps := channels.DetectVoiceCapabilities(name, ch, asrAvailable, ttsAvailable)
+		logger.InfoCF("voice", "Channel voice capabilities", map[string]any{
+			"channel": name,
+			"asr":     caps.ASR,
+			"tts":     caps.TTS,
+		})
+	}
 }
 
 func (p *startupBlockedProvider) Chat(
@@ -82,7 +114,8 @@ func (p *startupBlockedProvider) GetDefaultModel() string {
 }
 
 // Run starts the gateway runtime using the configuration loaded from configPath.
-func Run(debug bool, homePath, configPath string, allowEmptyStartup bool) error {
+func Run(debug bool, homePath, configPath string, allowEmptyStartup bool) (runErr error) {
+	startedAt := time.Now()
 	panicPath := filepath.Join(homePath, logPath, panicFile)
 	panicFunc, err := logger.InitPanic(panicPath)
 	if err != nil {
@@ -91,21 +124,69 @@ func Run(debug bool, homePath, configPath string, allowEmptyStartup bool) error 
 	defer panicFunc()
 
 	if err = logger.EnableFileLogging(filepath.Join(homePath, logPath, logFile)); err != nil {
-		panic(fmt.Sprintf("error enabling file logging: %v", err))
+		logger.Fatal(fmt.Sprintf("error enabling file logging: %v", err))
 	}
 	defer logger.DisableFileLogging()
+
+	if debug {
+		logger.SetLevel(logger.DEBUG)
+	} else {
+		logger.SetLevelFromString(config.ResolveGatewayLogLevel(configPath))
+	}
+	defer func() {
+		if runErr != nil {
+			logger.ErrorCF("gateway", "Gateway startup failed", map[string]any{
+				"config_path": configPath,
+				"error":       runErr.Error(),
+				"home_path":   homePath,
+				"allow_empty": allowEmptyStartup,
+				"debug":       debug,
+			})
+		}
+	}()
 
 	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
 		return fmt.Errorf("error loading config: %w", err)
 	}
 
-	logger.SetLevelFromString(cfg.Gateway.LogLevel)
-
-	if debug {
-		logger.SetLevel(logger.DEBUG)
-		fmt.Println("🔍 Debug mode enabled")
+	if err = preCheckConfig(cfg); err != nil {
+		return fmt.Errorf("config pre-check failed: %w", err)
 	}
+
+	// Debug mode permanently overrides the config log level to DEBUG.
+	if debug {
+		fmt.Println("🔍 Debug mode enabled")
+	} else {
+		effectiveLogLevel := config.EffectiveGatewayLogLevel(cfg)
+		logger.SetLevelFromString(effectiveLogLevel)
+		logger.Infof("Log level set to %q", effectiveLogLevel)
+	}
+
+	bindPlan, listenResult, err := openGatewayListeners(cfg.Gateway.Host, cfg.Gateway.Port)
+	if err != nil {
+		return fmt.Errorf("error opening gateway listeners: %w", err)
+	}
+
+	// Enforce singleton: write PID file with generated token.
+	pidData, err := pid.WritePidFile(homePath, bindPlan.ProbeHost, cfg.Gateway.Port)
+	if err != nil {
+		logger.Warnf("write pid file failed: %v", err)
+		for _, ln := range listenResult.Listeners {
+			_ = ln.Close()
+		}
+		return fmt.Errorf("singleton check failed: %w", err)
+	}
+	defer pid.RemovePidFile(homePath)
+	closeListeners := true
+	defer func() {
+		if !closeListeners {
+			return
+		}
+		for _, ln := range listenResult.Listeners {
+			_ = ln.Close()
+		}
+	}()
 
 	provider, modelID, err := createStartupProvider(cfg, allowEmptyStartup)
 	if err != nil {
@@ -118,6 +199,8 @@ func Run(debug bool, homePath, configPath string, allowEmptyStartup bool) error 
 
 	msgBus := bus.NewMessageBus()
 	agentLoop := agent.NewAgentLoop(cfg, msgBus, provider)
+	msgBus.SetEventPublisher(agentLoop.RuntimeEventBus())
+	publishGatewayEvent(agentLoop, runtimeevents.KindGatewayStart, startedAt, nil)
 
 	fmt.Println("\n📦 Agent Status:")
 	startupInfo := agentLoop.GetStartupInfo()
@@ -133,10 +216,12 @@ func Run(debug bool, homePath, configPath string, allowEmptyStartup bool) error 
 			"skills_available": skillsInfo["available"],
 		})
 
-	runningServices, err := setupAndStartServices(cfg, agentLoop, msgBus)
+	runningServices, err := setupAndStartServices(cfg, agentLoop, msgBus, pidData.Token, listenResult)
 	if err != nil {
 		return err
 	}
+	publishGatewayEvent(agentLoop, runtimeevents.KindGatewayReady, startedAt, nil)
+	closeListeners = false
 
 	// Setup manual reload channel for /reload endpoint
 	manualReloadChan := make(chan struct{}, 1)
@@ -157,7 +242,9 @@ func Run(debug bool, homePath, configPath string, allowEmptyStartup bool) error 
 	runningServices.HealthServer.SetReloadFunc(reloadTrigger)
 	agentLoop.SetReloadFunc(reloadTrigger)
 
-	fmt.Printf("✓ Gateway started on %s:%d\n", cfg.Gateway.Host, cfg.Gateway.Port)
+	for _, bindHost := range listenResult.BindHosts {
+		fmt.Printf("✓ Gateway started on %s\n", net.JoinHostPort(bindHost, strconv.Itoa(cfg.Gateway.Port)))
+	}
 	fmt.Println("Press Ctrl+C to stop")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -180,14 +267,14 @@ func Run(debug bool, homePath, configPath string, allowEmptyStartup bool) error 
 		select {
 		case <-sigChan:
 			logger.Info("Shutting down...")
-			shutdownGateway(runningServices, agentLoop, provider, true)
+			shutdownGateway(runningServices, agentLoop, provider, msgBus, true)
 			return nil
 		case newCfg := <-configReloadChan:
 			if !runningServices.reloading.CompareAndSwap(false, true) {
 				logger.Warn("Config reload skipped: another reload is in progress")
 				continue
 			}
-			err := executeReload(ctx, agentLoop, newCfg, &provider, runningServices, msgBus, allowEmptyStartup)
+			err := executeReload(ctx, agentLoop, newCfg, &provider, runningServices, msgBus, allowEmptyStartup, debug)
 			if err != nil {
 				logger.Errorf("Config reload failed: %v", err)
 			}
@@ -204,7 +291,7 @@ func Run(debug bool, homePath, configPath string, allowEmptyStartup bool) error 
 				runningServices.reloading.Store(false)
 				continue
 			}
-			err = executeReload(ctx, agentLoop, newCfg, &provider, runningServices, msgBus, allowEmptyStartup)
+			err = executeReload(ctx, agentLoop, newCfg, &provider, runningServices, msgBus, allowEmptyStartup, debug)
 			if err != nil {
 				logger.Errorf("Manual reload failed: %v", err)
 			} else {
@@ -212,6 +299,13 @@ func Run(debug bool, homePath, configPath string, allowEmptyStartup bool) error 
 			}
 		}
 	}
+}
+
+func preCheckConfig(cfg *config.Config) error {
+	if cfg.Gateway.Port <= 0 || cfg.Gateway.Port > 65535 {
+		return fmt.Errorf("invalid gateway port: %d, port must be between 1 and 65535", cfg.Gateway.Port)
+	}
+	return nil
 }
 
 func executeReload(
@@ -222,9 +316,21 @@ func executeReload(
 	runningServices *services,
 	msgBus *bus.MessageBus,
 	allowEmptyStartup bool,
-) error {
+	debug bool,
+) (err error) {
+	startedAt := time.Now()
+	publishGatewayEvent(agentLoop, runtimeevents.KindGatewayReloadStarted, startedAt, nil)
 	defer runningServices.reloading.Store(false)
-	return handleConfigReload(ctx, agentLoop, newCfg, provider, runningServices, msgBus, allowEmptyStartup)
+	defer func() {
+		if err != nil {
+			publishGatewayEvent(agentLoop, runtimeevents.KindGatewayReloadFailed, startedAt, err)
+			return
+		}
+		publishGatewayEvent(agentLoop, runtimeevents.KindGatewayReloadCompleted, startedAt, nil)
+	}()
+
+	err = handleConfigReload(ctx, agentLoop, newCfg, provider, runningServices, msgBus, allowEmptyStartup, debug)
+	return err
 }
 
 func createStartupProvider(
@@ -248,6 +354,8 @@ func setupAndStartServices(
 	cfg *config.Config,
 	agentLoop *agent.AgentLoop,
 	msgBus *bus.MessageBus,
+	authToken string,
+	listenResult netbind.OpenResult,
 ) (*services, error) {
 	runningServices := &services{}
 
@@ -290,7 +398,12 @@ func setupAndStartServices(
 		fms.Start()
 	}
 
-	runningServices.ChannelManager, err = channels.NewManager(cfg, msgBus, runningServices.MediaStore)
+	runningServices.ChannelManager, err = channels.NewManager(
+		cfg,
+		msgBus,
+		runningServices.MediaStore,
+		channels.WithRuntimeEvents(agentLoop.RuntimeEventBus()),
+	)
 	if err != nil {
 		if fms, ok := runningServices.MediaStore.(*media.FileMediaStore); ok {
 			fms.Stop()
@@ -301,10 +414,13 @@ func setupAndStartServices(
 	agentLoop.SetChannelManager(runningServices.ChannelManager)
 	agentLoop.SetMediaStore(runningServices.MediaStore)
 
-	if transcriber := voice.DetectTranscriber(cfg); transcriber != nil {
+	transcriber := asr.DetectTranscriber(cfg)
+	if transcriber != nil {
 		agentLoop.SetTranscriber(transcriber)
 		logger.InfoCF("voice", "Transcription enabled (agent-level)", map[string]any{"provider": transcriber.Name()})
 	}
+
+	ttsAvailable := tts.DetectTTS(cfg) != nil
 
 	enabledChannels := runningServices.ChannelManager.GetEnabledChannels()
 	if len(enabledChannels) > 0 {
@@ -313,18 +429,39 @@ func setupAndStartServices(
 		fmt.Println("⚠ Warning: No channels enabled")
 	}
 
-	addr := fmt.Sprintf("%s:%d", cfg.Gateway.Host, cfg.Gateway.Port)
-	runningServices.HealthServer = health.NewServer(cfg.Gateway.Host, cfg.Gateway.Port)
-	runningServices.ChannelManager.SetupHTTPServer(addr, runningServices.HealthServer)
+	runningServices.authToken = authToken
+	runningServices.HealthServer = health.NewServer(listenResult.ProbeHost, cfg.Gateway.Port, authToken)
+
+	var listenAddr string
+	if len(listenResult.Listeners) > 0 {
+		listenAddr = listenResult.Listeners[0].Addr().String()
+	} else {
+		listenAddr = net.JoinHostPort(listenResult.ProbeHost, strconv.Itoa(cfg.Gateway.Port))
+	}
+	runningServices.ChannelManager.SetupHTTPServerListeners(
+		listenResult.Listeners,
+		listenAddr,
+		runningServices.HealthServer,
+	)
 
 	if err = runningServices.ChannelManager.StartAll(context.Background()); err != nil {
 		return nil, fmt.Errorf("error starting channels: %w", err)
 	}
 
+	logChannelVoiceCapabilities(runningServices.ChannelManager, transcriber != nil, ttsAvailable)
+
+	if transcriber != nil {
+		// Start Voice Agent Orchestrator after channels are ready.
+		vaCtx, vaCancel := context.WithCancel(context.Background())
+		runningServices.VoiceAgentCancel = vaCancel
+		voiceAgent := asr.NewAgent(msgBus, transcriber)
+		voiceAgent.Start(vaCtx)
+	}
+
+	healthAddr := net.JoinHostPort(listenResult.ProbeHost, strconv.Itoa(cfg.Gateway.Port))
 	fmt.Printf(
-		"✓ Health endpoints available at http://%s:%d/health, /ready and /reload (POST)\n",
-		cfg.Gateway.Host,
-		cfg.Gateway.Port,
+		"✓ Health endpoints available at http://%s/health, /ready and /reload (POST)\n",
+		healthAddr,
 	)
 
 	stateManager := state.NewManager(cfg.WorkspacePath())
@@ -350,6 +487,9 @@ func stopAndCleanupServices(runningServices *services, shutdownTimeout time.Dura
 	if !isReload && runningServices.ChannelManager != nil {
 		runningServices.ChannelManager.StopAll(shutdownCtx)
 	}
+	if runningServices.VoiceAgentCancel != nil {
+		runningServices.VoiceAgentCancel()
+	}
 	if runningServices.DeviceService != nil {
 		runningServices.DeviceService.Stop()
 	}
@@ -370,13 +510,20 @@ func shutdownGateway(
 	runningServices *services,
 	agentLoop *agent.AgentLoop,
 	provider providers.LLMProvider,
+	msgBus *bus.MessageBus,
 	fullShutdown bool,
 ) {
+	publishGatewayEvent(agentLoop, runtimeevents.KindGatewayShutdown, time.Time{}, nil)
+
 	if cp, ok := provider.(providers.StatefulProvider); ok && fullShutdown {
 		cp.Close()
 	}
 
 	stopAndCleanupServices(runningServices, gracefulShutdownTimeout, false)
+
+	if fullShutdown && msgBus != nil {
+		msgBus.Close()
+	}
 
 	agentLoop.Stop()
 	agentLoop.Close()
@@ -392,6 +539,7 @@ func handleConfigReload(
 	runningServices *services,
 	msgBus *bus.MessageBus,
 	allowEmptyStartup bool,
+	debug bool,
 ) error {
 	logger.Info("🔄 Config file changed, reloading...")
 
@@ -440,6 +588,15 @@ func handleConfigReload(
 	}
 
 	logger.Info("  ✓ Provider, configuration, and services reloaded successfully (thread-safe)")
+
+	// Debug mode permanently overrides the config log level to DEBUG.
+	if !debug {
+		// Update log level last so that reload-related info/warn logs above are not suppressed.
+		effectiveLogLevel := config.EffectiveGatewayLogLevel(newCfg)
+		logger.SetLevelFromString(effectiveLogLevel)
+		logger.Infof("Log level changing from current to %q", effectiveLogLevel)
+	}
+
 	return nil
 }
 
@@ -516,13 +673,24 @@ func restartServices(
 		fmt.Println("  ✓ Device event service restarted")
 	}
 
-	transcriber := voice.DetectTranscriber(cfg)
+	transcriber := asr.DetectTranscriber(cfg)
 	al.SetTranscriber(transcriber)
 	if transcriber != nil {
 		logger.InfoCF("voice", "Transcription re-enabled (agent-level)", map[string]any{"provider": transcriber.Name()})
+
+		// Start Voice Agent Orchestrator on reload
+		vaCtx, vaCancel := context.WithCancel(context.Background())
+		runningServices.VoiceAgentCancel = vaCancel
+		voiceAgent := asr.NewAgent(msgBus, transcriber)
+		voiceAgent.Start(vaCtx)
 	} else {
 		logger.InfoCF("voice", "Transcription disabled", nil)
 	}
+
+	ttsAvailable := tts.DetectTTS(cfg) != nil
+	logChannelVoiceCapabilities(runningServices.ChannelManager, transcriber != nil, ttsAvailable)
+	// NOTE: PID file is written once at startup and not updated on reload.
+	// Changing the gateway listen address requires a full restart.
 
 	return nil
 }

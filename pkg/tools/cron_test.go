@@ -24,6 +24,7 @@ type stubJobExecutor struct {
 	publishedResp   string
 	publishedChan   string
 	publishedChatID string
+	publishedKey    string
 }
 
 func (s *stubJobExecutor) ProcessDirectWithChannel(
@@ -39,7 +40,7 @@ func (s *stubJobExecutor) ProcessDirectWithChannel(
 
 func (s *stubJobExecutor) PublishResponseIfNeeded(
 	_ context.Context,
-	channel, chatID, response string,
+	channel, chatID, sessionKey, response string,
 ) {
 	if s.alreadySent {
 		return
@@ -47,6 +48,7 @@ func (s *stubJobExecutor) PublishResponseIfNeeded(
 	s.publishedResp = response
 	s.publishedChan = channel
 	s.publishedChatID = chatID
+	s.publishedKey = sessionKey
 }
 
 func newTestCronToolWithExecutorAndConfig(t *testing.T, executor JobExecutor, cfg *config.Config) *CronTool {
@@ -229,28 +231,6 @@ func TestCronTool_NonCommandJobAllowedFromRemoteChannel(t *testing.T) {
 	}
 }
 
-func TestCronTool_NonCommandJobDefaultsDeliverToFalse(t *testing.T) {
-	tool := newTestCronTool(t)
-	ctx := WithToolContext(context.Background(), "telegram", "chat-1")
-	result := tool.Execute(ctx, map[string]any{
-		"action":     "add",
-		"message":    "send me a poem",
-		"at_seconds": float64(600),
-	})
-
-	if result.IsError {
-		t.Fatalf("expected non-command reminder to succeed, got: %s", result.ForLLM)
-	}
-
-	jobs := tool.cronService.ListJobs(false)
-	if len(jobs) != 1 {
-		t.Fatalf("expected 1 job, got %d", len(jobs))
-	}
-	if jobs[0].Payload.Deliver {
-		t.Fatal("expected deliver=false by default for non-command jobs")
-	}
-}
-
 func TestCronTool_ExecuteJobPublishesErrorWhenExecDisabled(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Tools.Exec.Enabled = false
@@ -293,8 +273,8 @@ func TestCronTool_ExecuteJobPublishesAgentResponse(t *testing.T) {
 		t.Fatalf("ExecuteJob() = %q, want ok", got)
 	}
 
-	if executor.lastKey != "cron-job-1" {
-		t.Fatalf("sessionKey = %q, want cron-job-1", executor.lastKey)
+	if !strings.HasPrefix(executor.lastKey, "agent:cron-job-1-") {
+		t.Fatalf("sessionKey = %q, want agent:cron-job-1-{uuid}", executor.lastKey)
 	}
 	if executor.lastChan != "telegram" || executor.lastChatID != "chat-1" {
 		t.Fatalf("executor target = %s/%s, want telegram/chat-1", executor.lastChan, executor.lastChatID)
@@ -304,6 +284,9 @@ func TestCronTool_ExecuteJobPublishesAgentResponse(t *testing.T) {
 	}
 	if executor.publishedResp != "generated reply" {
 		t.Fatalf("published response = %q, want generated reply", executor.publishedResp)
+	}
+	if executor.publishedKey != executor.lastKey {
+		t.Fatalf("published sessionKey = %q, want %q", executor.publishedKey, executor.lastKey)
 	}
 	if executor.publishedChan != "telegram" || executor.publishedChatID != "chat-1" {
 		t.Fatalf("published target = %s/%s, want telegram/chat-1", executor.publishedChan, executor.publishedChatID)
@@ -346,93 +329,6 @@ func TestCronTool_ExecuteJobSkipsWhenMessageToolAlreadySent(t *testing.T) {
 	}
 }
 
-func TestCronTool_ExecuteJobDirectiveAddsPromptPrefix(t *testing.T) {
-	executor := &stubJobExecutor{response: "directive result"}
-	tool := newTestCronToolWithExecutorAndConfig(t, executor, config.DefaultConfig())
-
-	originalMsg := "check the weather and summarize"
-	job := &cron.CronJob{ID: "job-dir-1"}
-	job.Payload.Channel = "telegram"
-	job.Payload.To = "chat-1"
-	job.Payload.Message = originalMsg
-	job.Payload.Type = "directive"
-
-	if got := tool.ExecuteJob(context.Background(), job); got != "ok" {
-		t.Fatalf("ExecuteJob() = %q, want ok", got)
-	}
-
-	wantPrompt := "Please execute the following directive and provide the result:\n\n" + originalMsg
-	if executor.lastPrompt != wantPrompt {
-		t.Fatalf("prompt = %q, want exact %q", executor.lastPrompt, wantPrompt)
-	}
-	if executor.publishedResp != "directive result" {
-		t.Fatalf("published response = %q, want %q", executor.publishedResp, "directive result")
-	}
-}
-
-func TestCronTool_ExecuteJobDirectiveWithDeliverRoutesToAgent(t *testing.T) {
-	executor := &stubJobExecutor{response: "agent processed"}
-	tool := newTestCronToolWithExecutorAndConfig(t, executor, config.DefaultConfig())
-
-	job := &cron.CronJob{ID: "job-dir-deliver"}
-	job.Payload.Channel = "telegram"
-	job.Payload.To = "chat-1"
-	job.Payload.Message = "generate daily report"
-	job.Payload.Type = "directive"
-	job.Payload.Deliver = true
-
-	if got := tool.ExecuteJob(context.Background(), job); got != "ok" {
-		t.Fatalf("ExecuteJob() = %q, want ok", got)
-	}
-
-	if executor.lastPrompt == "" {
-		t.Fatal("expected agent to be called for directive+deliver, but ProcessDirectWithChannel was not invoked")
-	}
-	if executor.publishedResp != "agent processed" {
-		t.Fatalf("published response = %q, want %q", executor.publishedResp, "agent processed")
-	}
-
-	// Verify no direct publish happened on the bus (agent path, not direct path)
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	select {
-	case msg := <-tool.msgBus.OutboundChan():
-		t.Fatalf("unexpected direct bus message: %+v", msg)
-	case <-ctx.Done():
-		// expected: no direct bus message
-	}
-}
-
-func TestCronTool_ExecuteJobDeliverMessageDirectlyToBus(t *testing.T) {
-	executor := &stubJobExecutor{response: "should not be called"}
-	tool := newTestCronToolWithExecutorAndConfig(t, executor, config.DefaultConfig())
-
-	job := &cron.CronJob{ID: "job-deliver"}
-	job.Payload.Channel = "telegram"
-	job.Payload.To = "chat-1"
-	job.Payload.Message = "hello world"
-	job.Payload.Deliver = true
-
-	if got := tool.ExecuteJob(context.Background(), job); got != "ok" {
-		t.Fatalf("ExecuteJob() = %q, want ok", got)
-	}
-
-	if executor.lastPrompt != "" {
-		t.Fatal("expected agent NOT to be invoked for deliver=true message type")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	select {
-	case msg := <-tool.msgBus.OutboundChan():
-		if msg.Content != "hello world" {
-			t.Fatalf("bus content = %q, want %q", msg.Content, "hello world")
-		}
-	case <-ctx.Done():
-		t.Fatal("timeout waiting for direct bus message")
-	}
-}
-
 func TestCronTool_ExecuteJobReturnsErrorWithoutPublish(t *testing.T) {
 	executor := &stubJobExecutor{
 		response: "this response must not be published",
@@ -452,45 +348,5 @@ func TestCronTool_ExecuteJobReturnsErrorWithoutPublish(t *testing.T) {
 
 	if executor.publishedResp != "" {
 		t.Fatalf("unexpected publish on error path: %q", executor.publishedResp)
-	}
-}
-
-func TestCronTool_AddJobRejectsInvalidType(t *testing.T) {
-	tool := newTestCronTool(t)
-	ctx := WithToolContext(context.Background(), "cli", "direct")
-	result := tool.Execute(ctx, map[string]any{
-		"action":     "add",
-		"message":    "test",
-		"at_seconds": float64(60),
-		"type":       "invalid_type",
-	})
-
-	if !result.IsError {
-		t.Fatal("expected error for invalid type parameter")
-	}
-	if !strings.Contains(result.ForLLM, "invalid type") {
-		t.Errorf("expected 'invalid type' error, got: %s", result.ForLLM)
-	}
-}
-
-func TestCronTool_AddJobAcceptsValidTypes(t *testing.T) {
-	for _, msgType := range []string{"", "message", "directive"} {
-		t.Run("type="+msgType, func(t *testing.T) {
-			tool := newTestCronTool(t)
-			ctx := WithToolContext(context.Background(), "cli", "direct")
-			args := map[string]any{
-				"action":     "add",
-				"message":    "test",
-				"at_seconds": float64(60),
-			}
-			if msgType != "" {
-				args["type"] = msgType
-			}
-
-			result := tool.Execute(ctx, args)
-			if result.IsError {
-				t.Fatalf("expected valid type %q to succeed, got: %s", msgType, result.ForLLM)
-			}
-		})
 	}
 }

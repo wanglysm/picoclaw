@@ -7,20 +7,16 @@ package config
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/sipeed/picoclaw/pkg/credential"
 	"github.com/sipeed/picoclaw/pkg/fileutil"
-	"github.com/sipeed/picoclaw/pkg/logger"
 )
 
 const (
@@ -34,11 +30,12 @@ func securityPath(configPath string) string {
 }
 
 // loadSecurityConfig loads the security configuration from security.yml
-// Returns an empty SecurityConfig if the file doesn't exist
+// and merges secure field values into the config.
 func loadSecurityConfig(cfg *Config, securityPath string) error {
 	if cfg == nil {
 		return fmt.Errorf("config is nil")
 	}
+
 	data, err := os.ReadFile(securityPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -47,8 +44,147 @@ func loadSecurityConfig(cfg *Config, securityPath string) error {
 		return fmt.Errorf("failed to read security config: %w", err)
 	}
 
-	if err := yaml.Unmarshal(data, cfg); err != nil {
+	// Save existing channels and ModelList before unmarshal
+	savedChannels := make(ChannelsConfig, len(cfg.Channels))
+	for name, bc := range cfg.Channels {
+		savedChannels[name] = bc
+	}
+	// savedModelList := cfg.ModelList
+
+	// Parse YAML into a yaml.Node tree to extract channels node
+	var rootNode yaml.Node
+	if err := yaml.Unmarshal(data, &rootNode); err != nil {
 		return fmt.Errorf("failed to parse security config: %w", err)
+	}
+
+	// Extract channels node (support both 'channels' and 'channel_list' keys)
+	var channelsNode *yaml.Node
+	if len(rootNode.Content) > 0 {
+		content := rootNode.Content[0].Content
+		for i := 0; i < len(content); i += 2 {
+			if i+1 < len(content) {
+				key := content[i].Value
+				if key == "channels" || key == "channel_list" {
+					channelsNode = content[i+1]
+					break
+				}
+			}
+		}
+	}
+
+	// Unmarshal non-channel fields from security.yml
+	// This will resolve encrypted values for model_list, tools, etc.
+	if err := yaml.Unmarshal(data, cfg); err != nil {
+		return fmt.Errorf("failed to parse security config %s: %w", securityPath, err)
+	}
+	if err := applyLegacySkillsSecurityConfig(cfg, data); err != nil {
+		return fmt.Errorf("failed to parse legacy skills security config: %w", err)
+	}
+
+	// Restore channels from saved, then manually merge from security.yml
+	cfg.Channels = make(ChannelsConfig)
+	for name, savedBC := range savedChannels {
+		cfg.Channels[name] = savedBC
+	}
+
+	// If we found a channels node in security.yml, merge it into existing channels
+	if channelsNode != nil {
+		if err := cfg.Channels.UnmarshalYAML(channelsNode); err != nil {
+			return fmt.Errorf("failed to merge channels from security config: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func applyLegacySkillsSecurityConfig(cfg *Config, data []byte) error {
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return err
+	}
+	if len(root.Content) == 0 {
+		return nil
+	}
+
+	rootMap := root.Content[0]
+	if rootMap == nil || rootMap.Kind != yaml.MappingNode {
+		return nil
+	}
+
+	for i := 0; i+1 < len(rootMap.Content); i += 2 {
+		keyNode := rootMap.Content[i]
+		valueNode := rootMap.Content[i+1]
+		if keyNode == nil || valueNode == nil || strings.TrimSpace(keyNode.Value) != "skills" {
+			continue
+		}
+		return applyLegacySkillsSecurityNode(cfg, valueNode)
+	}
+
+	return nil
+}
+
+func applyLegacySkillsSecurityNode(cfg *Config, skillsNode *yaml.Node) error {
+	if cfg == nil || skillsNode == nil || skillsNode.Kind != yaml.MappingNode {
+		return nil
+	}
+
+	for i := 0; i+1 < len(skillsNode.Content); i += 2 {
+		nameNode := skillsNode.Content[i]
+		valueNode := skillsNode.Content[i+1]
+		if nameNode == nil || valueNode == nil {
+			continue
+		}
+
+		name := strings.TrimSpace(nameNode.Value)
+		if name == "" || name == "registries" {
+			continue
+		}
+
+		if name == "github" {
+			var legacyGitHub SkillsGithubConfig
+			if err := valueNode.Decode(&legacyGitHub); err != nil {
+				return err
+			}
+			if cfg.Tools.Skills.Github.Token.String() == "" && legacyGitHub.Token.String() != "" {
+				cfg.Tools.Skills.Github.Token = legacyGitHub.Token
+			}
+		}
+
+		var legacyRegistry SkillRegistryConfig
+		if err := valueNode.Decode(&legacyRegistry); err != nil {
+			return err
+		}
+		legacyRegistry.Name = name
+		if legacyRegistry.AuthToken.String() == "" {
+			if name == "github" && cfg.Tools.Skills.Github.Token.String() != "" {
+				legacyRegistry.AuthToken = cfg.Tools.Skills.Github.Token
+			} else {
+				continue
+			}
+		}
+
+		registryCfg, ok := cfg.Tools.Skills.Registries.Get(name)
+		if !ok {
+			registryCfg = SkillRegistryConfig{
+				Name:  name,
+				Param: map[string]any{},
+			}
+		}
+		if registryCfg.Param == nil {
+			registryCfg.Param = map[string]any{}
+		}
+		if registryCfg.AuthToken.String() == "" {
+			registryCfg.AuthToken = legacyRegistry.AuthToken
+		}
+		if registryCfg.BaseURL == "" && legacyRegistry.BaseURL != "" {
+			registryCfg.BaseURL = legacyRegistry.BaseURL
+		}
+		for key, value := range legacyRegistry.Param {
+			if _, exists := registryCfg.Param[key]; !exists {
+				registryCfg.Param[key] = value
+			}
+		}
+		cfg.Tools.Skills.Registries.Set(name, registryCfg)
 	}
 
 	return nil
@@ -66,7 +202,6 @@ func saveSecurityConfig(securityPath string, sec *Config) error {
 	return fileutil.WriteFileAtomic(securityPath, buf.Bytes(), 0o600)
 }
 
-// SensitiveDataCache caches the compiled regex for filtering sensitive data.
 // SensitiveDataCache caches the strings.Replacer for filtering sensitive data.
 // Computed once on first access via sync.Once.
 type SensitiveDataCache struct {
@@ -126,9 +261,25 @@ func collectSensitive(v reflect.Value, values *[]string) {
 
 	t := v.Type()
 
+	// Channel: use CollectSensitiveValues() method
+	if t == reflect.TypeOf(Channel{}) {
+		if method := v.MethodByName("CollectSensitiveValues"); method.IsValid() {
+			results := method.Call(nil)
+			if len(results) > 0 {
+				if vals, ok := results[0].Interface().([]string); ok {
+					*values = append(*values, vals...)
+				}
+			}
+		}
+		return
+	}
+
 	// SecureString: collect via String() method (defined on *SecureString)
 	if t == reflect.TypeOf(SecureString{}) {
-		result := v.Addr().MethodByName("String").Call(nil)
+		// Create a new pointer to make it addressable for method calls
+		ptr := reflect.New(t)
+		ptr.Elem().Set(v)
+		result := ptr.MethodByName("String").Call(nil)
 		if len(result) > 0 {
 			if s := result[0].String(); s != "" {
 				*values = append(*values, s)
@@ -177,235 +328,4 @@ func collectSensitive(v reflect.Value, values *[]string) {
 			collectSensitive(v.MapIndex(key), values)
 		}
 	}
-}
-
-const (
-	notHere = `"[NOT_HERE]"`
-)
-
-// SecureStrings is a slice of SecureString
-type SecureStrings []*SecureString
-
-// Values returns the decrypted/resolved values
-func (s *SecureStrings) Values() []string {
-	if s == nil {
-		return nil
-	}
-	keys := make([]string, len(*s))
-	for i, k := range *s {
-		keys[i] = k.String()
-	}
-	return unique(keys)
-}
-
-func SimpleSecureStrings(val ...string) SecureStrings {
-	val = unique(val)
-	vv := make(SecureStrings, len(val))
-	for i, s := range val {
-		vv[i] = NewSecureString(s)
-	}
-	return vv
-}
-
-// unique returns a new slice with duplicate elements removed.
-func unique[T comparable](input []T) []T {
-	m := make(map[T]struct{})
-	var result []T
-	for _, v := range input {
-		if _, ok := m[v]; !ok {
-			m[v] = struct{}{}
-			result = append(result, v)
-		}
-	}
-	return result
-}
-
-func (s SecureStrings) MarshalJSON() ([]byte, error) {
-	return []byte(notHere), nil
-}
-
-func (s *SecureStrings) UnmarshalJSON(value []byte) error {
-	if string(value) == notHere {
-		return nil
-	}
-	var v []*SecureString
-	err := json.Unmarshal(value, &v)
-	if err != nil {
-		return err
-	}
-	*s = v
-	return nil
-}
-
-// SecureString the string value that can be decrypted or resolved
-//
-//nolint:recvcheck
-type SecureString struct {
-	resolved string // Decrypted/resolved value returned by String()
-	raw      string // Persisted raw value (enc://, file://, or plaintext)
-}
-
-func callerFromYaml() bool {
-	_, file, _, ok := runtime.Caller(2)
-	if ok {
-		d := filepath.Dir(file)
-		// check the caller is from yaml.v
-		if !strings.Contains(d, "yaml.v") {
-			return true
-		}
-	}
-	return false
-}
-
-// IsZero returns true if the SecureString is empty
-// if caller not yaml, just return true for prevent marshal this field
-func (s SecureString) IsZero() bool {
-	if callerFromYaml() {
-		return true
-	}
-	return s.resolved == ""
-}
-
-func NewSecureString(value string) *SecureString {
-	s := &SecureString{}
-	if err := s.fromRaw(value); err != nil {
-		logger.Warn(fmt.Sprintf("NewSecureString.fromRaw error: %s", err))
-	}
-	return s
-}
-
-func (s *SecureString) String() string {
-	if s == nil {
-		return ""
-	}
-	return s.resolved
-}
-
-func (s *SecureString) Set(value string) *SecureString {
-	s.resolved = value
-	s.raw = ""
-	return s
-}
-
-func (s SecureString) MarshalJSON() ([]byte, error) {
-	return []byte(notHere), nil
-}
-
-func (s *SecureString) UnmarshalJSON(value []byte) error {
-	if string(value) == notHere {
-		return nil
-	}
-	var v string
-	if err := json.Unmarshal(value, &v); err != nil {
-		return err
-	}
-	return s.fromRaw(v)
-}
-
-func (s SecureString) MarshalYAML() (any, error) {
-	// Preserve raw value if it is already a reference (enc:// or file://)
-	if strings.HasPrefix(s.raw, credential.EncScheme) || strings.HasPrefix(s.raw, credential.FileScheme) {
-		return s.raw, nil
-	}
-	// If resolved is a reference format (e.g. set via Set), copy back to raw
-	if strings.HasPrefix(s.resolved, credential.EncScheme) || strings.HasPrefix(s.resolved, credential.FileScheme) {
-		s.raw = s.resolved
-		return s.raw, nil
-	}
-	// Try to encrypt the resolved value
-	if passphrase := credential.PassphraseProvider(); passphrase != "" {
-		encrypted, err := credential.Encrypt(passphrase, "", s.resolved)
-		if err != nil {
-			logger.Errorf("Encrypt error: %v", err)
-			return nil, err
-		}
-		s.raw = encrypted
-	} else {
-		s.raw = s.resolved
-	}
-	return s.raw, nil
-}
-
-func (s *SecureString) UnmarshalYAML(value *yaml.Node) error {
-	return s.fromRaw(value.Value)
-}
-
-func (s *SecureString) fromRaw(v string) error {
-	s.raw = v
-	vv, err := resolveKey(v)
-	if err != nil {
-		return err
-	}
-	s.resolved = vv
-	return nil
-}
-
-var (
-	secResolverMu sync.RWMutex
-	secResolver   *credential.Resolver
-)
-
-func updateResolver(path string) {
-	secResolverMu.Lock()
-	defer secResolverMu.Unlock()
-	secResolver = credential.NewResolver(path)
-}
-
-func resolveKey(v string) (string, error) {
-	secResolverMu.RLock()
-	resolver := secResolver
-	secResolverMu.RUnlock()
-	if resolver == nil {
-		resolver = credential.NewResolver("")
-	}
-	if strings.HasPrefix(v, "enc://") || strings.HasPrefix(v, "file://") {
-		decrypted, err := resolver.Resolve(v)
-		if err != nil {
-			logger.Errorf("Resolve error: %v", err)
-			return "", err
-		}
-		return decrypted, nil
-	}
-	return v, nil
-}
-
-func (s *SecureString) UnmarshalText(text []byte) error {
-	v := string(text)
-	return s.fromRaw(v)
-}
-
-type SecureModelList []*ModelConfig
-
-func (v *SecureModelList) UnmarshalYAML(value *yaml.Node) error {
-	mm := make(map[string]*ModelConfig)
-	if err := value.Decode(&mm); err != nil {
-		logger.Errorf("Decode error: %v", err)
-		return err
-	}
-	nameList := toNameIndex(*v)
-	for i, m := range *v {
-		sec := mm[nameList[i]]
-		if sec == nil {
-			sec = mm[m.ModelName]
-		}
-		if sec != nil {
-			m.APIKeys = sec.APIKeys
-		}
-	}
-	return nil
-}
-
-func (v SecureModelList) MarshalYAML() (any, error) {
-	type onlySecureData struct {
-		APIKeys SecureStrings `yaml:"api_keys,omitempty"`
-	}
-	mm := make(map[string]onlySecureData)
-	nameList := toNameIndex(v)
-	for i, m := range v {
-		mm[nameList[i]] = onlySecureData{
-			APIKeys: m.APIKeys,
-		}
-	}
-
-	return mm, nil
 }

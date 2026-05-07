@@ -10,6 +10,11 @@ import { useTranslation } from "react-i18next"
 
 import type { ModelInfo } from "@/api/models"
 import { Button } from "@/components/ui/button"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
 
 interface ModelCardProps {
   model: ModelInfo
@@ -28,14 +33,39 @@ export function ModelCard({
 }: ModelCardProps) {
   const { t } = useTranslation()
   const isOAuth = model.auth_method === "oauth"
+  const status = model.status
+  const statusLabel = t(`models.status.${status}`)
   const canSetDefault =
-    model.configured && !model.is_default && !model.is_virtual
+    model.available &&
+    !model.is_default &&
+    !model.is_virtual &&
+    model.default_model_allowed !== false
+
+  const setDefaultLabel = t("models.action.setDefault")
+  const setDefaultDisabledReason = (() => {
+    if (settingDefault) return t("models.action.setDefaultDisabled.setting")
+    if (!model.available)
+      return t("models.action.setDefaultDisabled.unavailable")
+    if (model.is_default) return t("models.action.setDefaultDisabled.isDefault")
+    if (model.is_virtual) return t("models.action.setDefaultDisabled.isVirtual")
+    if (model.default_model_allowed === false) {
+      return t("models.action.setDefaultDisabled.unsupportedProvider")
+    }
+    return setDefaultLabel
+  })()
+
+  const editLabel = t("models.action.edit")
+  const deleteLabel = t("models.action.delete")
+  const deleteDisabledReason = model.is_default
+    ? t("models.action.deleteDisabled.isDefault")
+    : deleteLabel
+  const deleteDisabled = model.is_default
 
   return (
     <div
       className={[
         "group/card hover:bg-muted/30 relative flex w-full max-w-[36rem] flex-col gap-3 justify-self-start rounded-xl border p-4 transition-colors hover:shadow-xs",
-        model.configured
+        model.available
           ? "border-border/60 bg-card"
           : "border-border/50 bg-card/60",
       ].join(" ")}
@@ -47,15 +77,13 @@ export function ModelCard({
               "mt-0.5 h-2 w-2 shrink-0 rounded-full",
               model.is_default
                 ? "bg-green-400 shadow-[0_0_0_2px_rgba(74,222,128,0.35)]"
-                : model.configured
+                : status === "available"
                   ? "bg-green-500"
-                  : "bg-muted-foreground/25",
+                  : status === "unreachable"
+                    ? "bg-amber-500"
+                    : "bg-muted-foreground/25",
             ].join(" ")}
-            title={
-              model.configured
-                ? t("models.status.configured")
-                : t("models.status.unconfigured")
-            }
+            title={statusLabel}
           />
           <span className="text-foreground truncate text-sm font-semibold">
             {model.model_name}
@@ -81,40 +109,85 @@ export function ModelCard({
               <IconStarFilled className="size-3.5" />
             </span>
           ) : (
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              onClick={() => onSetDefault(model)}
-              disabled={settingDefault || !canSetDefault}
-              title={t("models.action.setDefault")}
-            >
-              {settingDefault ? (
-                <IconLoader2 className="size-3.5 animate-spin" />
-              ) : (
-                <IconStar className="size-3.5" />
-              )}
-            </Button>
+            <Tooltip delayDuration={!canSetDefault || settingDefault ? 0 : 700}>
+              <TooltipTrigger asChild>
+                <span
+                  className={
+                    !canSetDefault || settingDefault
+                      ? "cursor-not-allowed"
+                      : undefined
+                  }
+                  tabIndex={!canSetDefault || settingDefault ? 0 : undefined}
+                  role={!canSetDefault || settingDefault ? "button" : undefined}
+                  aria-disabled={
+                    !canSetDefault || settingDefault ? true : undefined
+                  }
+                  aria-label={
+                    !canSetDefault || settingDefault
+                      ? setDefaultLabel
+                      : undefined
+                  }
+                  title={
+                    !canSetDefault || settingDefault
+                      ? setDefaultLabel
+                      : undefined
+                  }
+                >
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    onClick={() => onSetDefault(model)}
+                    disabled={settingDefault || !canSetDefault}
+                    aria-label={setDefaultLabel}
+                    title={setDefaultLabel}
+                  >
+                    {settingDefault ? (
+                      <IconLoader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <IconStar className="size-3.5" />
+                    )}
+                  </Button>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>{setDefaultDisabledReason}</TooltipContent>
+            </Tooltip>
           )}
 
           <Button
             variant="ghost"
             size="icon-sm"
             onClick={() => onEdit(model)}
-            title={t("models.action.edit")}
+            aria-label={editLabel}
+            title={editLabel}
           >
             <IconEdit className="size-3.5" />
           </Button>
 
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={() => onDelete(model)}
-            disabled={model.is_default}
-            title={t("models.action.delete")}
-            className="text-muted-foreground hover:text-destructive hover:bg-destructive/10"
-          >
-            <IconTrash className="size-3.5" />
-          </Button>
+          <Tooltip delayDuration={deleteDisabled ? 0 : 700}>
+            <TooltipTrigger asChild>
+              <span
+                className={deleteDisabled ? "cursor-not-allowed" : undefined}
+                tabIndex={deleteDisabled ? 0 : undefined}
+                role={deleteDisabled ? "button" : undefined}
+                aria-disabled={deleteDisabled ? true : undefined}
+                aria-label={deleteDisabled ? deleteLabel : undefined}
+                title={deleteDisabled ? deleteLabel : undefined}
+              >
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  onClick={() => onDelete(model)}
+                  disabled={deleteDisabled}
+                  aria-label={deleteLabel}
+                  title={deleteLabel}
+                  className="text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+                >
+                  <IconTrash className="size-3.5" />
+                </Button>
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>{deleteDisabledReason}</TooltipContent>
+          </Tooltip>
         </div>
       </div>
 
@@ -127,14 +200,14 @@ export function ModelCard({
           <span className="text-muted-foreground bg-muted rounded px-1.5 py-0.5 text-[10px] font-medium">
             OAuth
           </span>
-        ) : model.configured && model.api_key ? (
+        ) : status === "available" && model.api_key ? (
           <span className="text-muted-foreground/70 flex items-center gap-1 font-mono text-[11px]">
             <IconKey className="size-3" />
             {model.api_key}
           </span>
         ) : (
           <span className="text-muted-foreground/50 text-[11px]">
-            {t("models.status.unconfigured")}
+            {statusLabel}
           </span>
         )}
       </div>

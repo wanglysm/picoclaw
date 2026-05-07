@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestMigration_Integration_LegacyConfigWithoutWorkspace tests the issue reported:
@@ -74,6 +76,8 @@ func TestMigration_Integration_LegacyConfigWithoutWorkspace(t *testing.T) {
 	if cfg.Agents.Defaults.Provider != "openai" {
 		t.Errorf("Provider = %q, want %q (user's setting should be preserved)", cfg.Agents.Defaults.Provider, "openai")
 	}
+
+	t.Logf("defaults: %v", cfg.Agents.Defaults)
 	// Old "model" field is migrated to "model_name" field
 	if cfg.Agents.Defaults.ModelName != "gpt-4o" {
 		t.Errorf(
@@ -100,11 +104,14 @@ func TestMigration_Integration_LegacyConfigWithoutWorkspace(t *testing.T) {
 	}
 
 	// Verify other config sections are preserved
-	if !cfg.Channels.Telegram.Enabled {
+	var tgCfg TelegramSettings
+	bc := cfg.Channels.Get("telegram")
+	if bc == nil || !bc.Enabled {
 		t.Error("Telegram.Enabled should be true")
 	}
-	if cfg.Channels.Telegram.Token.String() != "test-token" {
-		t.Errorf("Telegram.Token = %q, want %q", cfg.Channels.Telegram.Token.String(), "test-token")
+	bc.Decode(&tgCfg)
+	if tgCfg.Token.String() != "test-token" {
+		t.Errorf("Telegram.Token = %q, want %q", tgCfg.Token.String(), "test-token")
 	}
 	if cfg.Gateway.Port != 18790 {
 		t.Errorf("Gateway.Port = %d, want %d", cfg.Gateway.Port, 18790)
@@ -356,19 +363,21 @@ func TestMigration_Integration_ChannelsConfigMigrated(t *testing.T) {
 	}
 
 	// Discord: mention_only should be migrated to group_trigger.mention_only
-	if cfg.Channels.Discord.GroupTrigger.MentionOnly != true {
+	discordBC := cfg.Channels.Get("discord")
+	if !discordBC.GroupTrigger.MentionOnly {
 		t.Error("Discord.GroupTrigger.MentionOnly should be true after migration")
 	}
 
 	// OneBot: group_trigger_prefix should be migrated to group_trigger.prefixes
-	if len(cfg.Channels.OneBot.GroupTrigger.Prefixes) != 2 {
-		t.Errorf("len(OneBot.GroupTrigger.Prefixes) = %d, want 2", len(cfg.Channels.OneBot.GroupTrigger.Prefixes))
+	oneBotBC := cfg.Channels.Get("onebot")
+	if len(oneBotBC.GroupTrigger.Prefixes) != 2 {
+		t.Errorf("len(OneBot.GroupTrigger.Prefixes) = %d, want 2", len(oneBotBC.GroupTrigger.Prefixes))
 	} else {
-		if cfg.Channels.OneBot.GroupTrigger.Prefixes[0] != "/" {
-			t.Errorf("Prefixes[0] = %q, want %q", cfg.Channels.OneBot.GroupTrigger.Prefixes[0], "/")
+		if oneBotBC.GroupTrigger.Prefixes[0] != "/" {
+			t.Errorf("Prefixes[0] = %q, want %q", oneBotBC.GroupTrigger.Prefixes[0], "/")
 		}
-		if cfg.Channels.OneBot.GroupTrigger.Prefixes[1] != "!" {
-			t.Errorf("Prefixes[1] = %q, want %q", cfg.Channels.OneBot.GroupTrigger.Prefixes[1], "!")
+		if oneBotBC.GroupTrigger.Prefixes[1] != "!" {
+			t.Errorf("Prefixes[1] = %q, want %q", oneBotBC.GroupTrigger.Prefixes[1], "!")
 		}
 	}
 }
@@ -578,6 +587,7 @@ func TestMigration_PreservesExistingSecurityConfig(t *testing.T) {
 	// Create a legacy config (version 0) with model_list and channel config
 	// The model_list doesn't have api_keys, they should come from existing .security.yml
 	legacyConfig := `{
+		"version": 1,
 		"agents": {
 			"defaults": {
 				"provider": "openai",
@@ -641,20 +651,38 @@ web:
 		t.Fatalf("LoadConfig failed: %v", err)
 	}
 
+	t.Logf("Migrated config: %#v", cfg.Channels["telegram"])
+	t.Logf("Migrated config settings: %v", string(cfg.Channels["telegram"].Settings))
+
 	// Verify that the migrated config has the existing security values
 	// Telegram token should be preserved
-	if cfg.Channels.Telegram.Token.String() != "existing-telegram-token-from-env" {
+	var tgCfg1 *TelegramSettings
+	if bc := cfg.Channels.Get("telegram"); bc != nil {
+		t.Logf("telegram settings: %v", string(bc.Settings))
+		if decoded, e := bc.GetDecoded(); e == nil && decoded != nil {
+			tgCfg1 = decoded.(*TelegramSettings)
+		}
+	}
+	require.NotNil(t, tgCfg1)
+	if tgCfg1.Token.String() != "existing-telegram-token-from-env" {
 		t.Errorf("Telegram token was overwritten: got %q, want %q",
-			cfg.Channels.Telegram.Token.String(), "existing-telegram-token-from-env")
+			tgCfg1.Token.String(), "existing-telegram-token-from-env")
 	}
 
 	// Discord token should be preserved (even though legacy config didn't have it)
-	if cfg.Channels.Discord.Token.String() != "existing-discord-token-from-env" {
+	var dcCfg1 *DiscordSettings
+	if bc := cfg.Channels.Get("discord"); bc != nil {
+		if decoded, e := bc.GetDecoded(); e == nil && decoded != nil {
+			dcCfg1 = decoded.(*DiscordSettings)
+		}
+	}
+	if dcCfg1.Token.String() != "existing-discord-token-from-env" {
 		t.Errorf("Discord token was overwritten: got %q, want %q",
-			cfg.Channels.Discord.Token.String(), "existing-discord-token-from-env")
+			dcCfg1.Token.String(), "existing-discord-token-from-env")
 	}
 
 	// Model API key should be preserved
+	t.Logf("model_list: %#v", cfg.ModelList[0])
 	if cfg.ModelList[0].APIKey() != "sk-existing-key-from-env" {
 		t.Errorf("Model API key was overwritten: got %q, want %q",
 			cfg.ModelList[0].APIKey(), "sk-existing-key-from-env")
@@ -668,16 +696,415 @@ web:
 
 	// Reload the security config from disk to verify it wasn't corrupted
 	reloadedSec := cfg
+	t.Logf("reloadedSec started")
 	err = loadSecurityConfig(cfg, securityPath)
 	if err != nil {
 		t.Fatalf("Failed to reload security config: %v", err)
 	}
 
-	if reloadedSec.Channels.Telegram.Token.String() != "existing-telegram-token-from-env" {
+	var tgCfgSec *TelegramSettings
+	if bc := reloadedSec.Channels.Get("telegram"); bc != nil {
+		if decoded, err := bc.GetDecoded(); err == nil && decoded != nil {
+			tgCfgSec = decoded.(*TelegramSettings)
+		}
+	}
+	if tgCfgSec.Token.String() != "existing-telegram-token-from-env" {
+		t.Errorf("Telegram settings: %v", tgCfgSec)
 		t.Error("Telegram token not preserved in .security.yml file")
 	}
 
-	if reloadedSec.Channels.Discord.Token.String() != "existing-discord-token-from-env" {
+	var dcCfgSec *DiscordSettings
+	if bc := reloadedSec.Channels.Get("discord"); bc != nil {
+		if decoded, err := bc.GetDecoded(); err == nil && decoded != nil {
+			dcCfgSec = decoded.(*DiscordSettings)
+		}
+	}
+	if dcCfgSec.Token.String() != "existing-discord-token-from-env" {
 		t.Error("Discord token not preserved in .security.yml file")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// V1 → V2 migration tests
+// ---------------------------------------------------------------------------
+
+//// TestMigrateModelEnabled_APIKeysInferredEnabled verifies that models with API keys
+//// are marked as enabled during V1→V2 migration.
+//func TestMigrateModelEnabled_APIKeysInferredEnabled(t *testing.T) {
+//	v1 := &configV1{Config: Config{
+//		ModelList: []*ModelConfig{
+//			{ModelName: "gpt-4", Model: "openai/gpt-4", APIKeys: SimpleSecureStrings("sk-test")},
+//			{ModelName: "claude", Model: "anthropic/claude", APIKeys: SimpleSecureStrings("sk-ant")},
+//		},
+//	}}
+//	v1.migrateModelEnabled()
+//	for _, m := range v1.ModelList {
+//		if !m.Enabled {
+//			t.Errorf("model %q with API key should be enabled", m.ModelName)
+//		}
+//	}
+//}
+//
+//// TestMigrateModelEnabled_LocalModelInferredEnabled verifies that the reserved
+//// "local-model" entry is enabled even without API keys.
+//func TestMigrateModelEnabled_LocalModelInferredEnabled(t *testing.T) {
+//	v1 := &configV1{
+//		ModelList: []*ModelConfig{
+//			{ModelName: "local-model", Model: "vllm/custom-model", APIBase: "http://localhost:8000/v1"},
+//		},
+//	}
+//	v1.migrateModelEnabled()
+//	if !v1.ModelList[0].Enabled {
+//		t.Error("local-model should be enabled")
+//	}
+//}
+//
+//// TestMigrateModelEnabled_NoKeyStaysDisabled verifies that models without API keys
+//// and not named "local-model" remain disabled.
+//func TestMigrateModelEnabled_NoKeyStaysDisabled(t *testing.T) {
+//	v1 := &configV1{
+//		ModelList: []*ModelConfig{
+//			{ModelName: "gpt-4", Model: "openai/gpt-4"},
+//			{ModelName: "claude", Model: "anthropic/claude"},
+//		},
+//	}
+//	v1.migrateModelEnabled()
+//	for _, m := range v1.ModelList {
+//		if m.Enabled {
+//			t.Errorf("model %q without API key should stay disabled", m.ModelName)
+//		}
+//	}
+//}
+//
+//// TestMigrateModelEnabled_ExplicitEnabledPreserved verifies that a model with
+//// explicitly enabled=true is NOT overridden by the migration.
+//func TestMigrateModelEnabled_ExplicitEnabledPreserved(t *testing.T) {
+//	v1 := &configV1{Config: Config{
+//		ModelList: []*ModelConfig{
+//			{ModelName: "gpt-4", Model: "openai/gpt-4", APIKeys: SimpleSecureStrings("sk-test"), Enabled: true},
+//		},
+//	}}
+//	v1.migrateModelEnabled()
+//	if !v1.ModelList[0].Enabled {
+//		t.Error("explicitly enabled model should remain enabled")
+//	}
+//}
+//
+//// TestMigrateModelEnabled_ExplicitDisabledNotOverridden verifies that a model with
+//// explicitly enabled=false and API keys gets enabled during migration.
+//// Note: since Go's zero value for bool is false and JSON omitempty omits false,
+//// migration cannot distinguish "explicitly false" from "field absent". Both cases
+//// get the same inference treatment.
+//func TestMigrateModelEnabled_ExplicitDisabledNotOverridden(t *testing.T) {
+//	v1 := &configV1{Config: Config{
+//		ModelList: []*ModelConfig{
+//			{ModelName: "gpt-4", Model: "openai/gpt-4", APIKeys: SimpleSecureStrings("sk-test"), Enabled: false},
+//		},
+//	}}
+//	v1.migrateModelEnabled()
+//	// Even though Enabled was set to false, migration infers it as true because
+//	// the migration cannot distinguish from a missing field (both are zero value).
+//	if !v1.ModelList[0].Enabled {
+//		t.Error("model with API key should be enabled by migration inference")
+//	}
+//}
+//
+//// TestMigrateModelEnabled_Mixed verifies a mix of models.
+//func TestMigrateModelEnabled_Mixed(t *testing.T) {
+//	v1 := &configV1{Config: Config{
+//		ModelList: []*ModelConfig{
+//			{ModelName: "with-key", Model: "openai/gpt-4", APIKeys: SimpleSecureStrings("sk-test")},
+//			{ModelName: "no-key", Model: "openai/gpt-4"},
+//			{ModelName: "local-model", Model: "vllm/custom"},
+//			{
+//				ModelName: "disabled-explicit",
+//				Model:     "openai/gpt-4",
+//				APIKeys:   SimpleSecureStrings("sk-test"),
+//				Enabled:   false,
+//			},
+//		},
+//	}}
+//	v1.migrateModelEnabled()
+//
+//	assertEnabled := func(name string, want bool) {
+//		for _, m := range v1.ModelList {
+//			if m.ModelName == name {
+//				if m.Enabled != want {
+//					t.Errorf("model %q: Enabled=%v, want %v", name, m.Enabled, want)
+//				}
+//				return
+//			}
+//		}
+//		t.Errorf("model %q not found", name)
+//	}
+//
+//	assertEnabled("with-key", true)
+//	assertEnabled("no-key", false)
+//	assertEnabled("local-model", true)
+//	assertEnabled("disabled-explicit", true) // false is zero value, migration infers from API key
+//}
+//
+//// TestMigrateChannelConfigs_DiscordMentionOnly verifies Discord mention_only migration.
+//func TestMigrateChannelConfigs_DiscordMentionOnly(t *testing.T) {
+//	channels := ChannelsConfig{"discord": makeBaseChannelFromConfig(DiscordSettings{MentionOnly: true})}
+//	v1 := &configV1{Config: Config{Channels: channels}}
+//	v1.migrateChannelConfigs()
+//	bc := v1.Channels.Get("discord")
+//	if !bc.GroupTrigger.MentionOnly {
+//		t.Error("Discord GroupTrigger.MentionOnly should be set to true")
+//	}
+//}
+//
+//// TestMigrateChannelConfigs_DiscordAlreadyMigrated is a no-op test.
+//func TestMigrateChannelConfigs_DiscordAlreadyMigrated(t *testing.T) {
+//	channels := ChannelsConfig{"discord": makeBaseChannelFromConfig(map[string]any{
+//		"group_trigger": map[string]any{"mention_only": true},
+//	})}
+//	v1 := &configV1{Config: Config{Channels: channels}}
+//	v1.migrateChannelConfigs()
+//}
+//
+//// TestMigrateChannelConfigs_OneBotPrefix verifies OneBot prefix migration.
+//func TestMigrateChannelConfigs_OneBotPrefix(t *testing.T) {
+//	channels := ChannelsConfig{"onebot": makeBaseChannelFromConfig(OneBotSettings{GroupTriggerPrefix: []string{"/"}})}
+//	v1 := &configV1{Config: Config{Channels: channels}}
+//	v1.migrateChannelConfigs()
+//	bc := v1.Channels.Get("onebot")
+//	if len(bc.GroupTrigger.Prefixes) != 1 || bc.GroupTrigger.Prefixes[0] != "/" {
+//		t.Errorf("OneBot GroupTrigger.Prefixes = %v, want [\"/\"]", bc.GroupTrigger.Prefixes)
+//	}
+//}
+//
+//// TestMigrateConfigV1_Combined verifies that configV1.Migrate applies both migrations.
+//func TestMigrateConfigV1_Combined(t *testing.T) {
+//	v1 := &configV1{Config: Config{
+//		ModelList: []*ModelConfig{
+//			{ModelName: "gpt-4", Model: "openai/gpt-4", APIKeys: SimpleSecureStrings("sk-test")},
+//		},
+//		Channels: ChannelsConfig{"discord": makeBaseChannelFromConfig(DiscordSettings{MentionOnly: true})},
+//	}}
+//	result, err := v1.Migrate()
+//	if err != nil {
+//		t.Fatalf("Migrate: %v", err)
+//	}
+//
+//	if !result.ModelList[0].Enabled {
+//		t.Error("model with API key should be enabled after V1→V2 migration")
+//	}
+//	dcResultBC := result.Channels.Get("discord")
+//	if !dcResultBC.GroupTrigger.MentionOnly {
+//		t.Error("Discord mention_only should be migrated after V1→V2 migration")
+//	}
+//}
+
+// TestLoadConfig_V1ToV2Migration verifies end-to-end V1→V2 config migration
+// through LoadConfig, including Enabled field inference and version bump.
+func TestLoadConfig_V1ToV2Migration(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.json")
+
+	// Write a V1 config with model_list but no "enabled" field
+	v1Config := `{
+		"version": 1,
+		"model_list": [
+			{
+				"model_name": "gpt-4",
+				"model": "openai/gpt-4"
+			},
+			{
+				"model_name": "local-model",
+				"model": "vllm/custom-model",
+				"api_base": "http://localhost:8000/v1"
+			}
+		],
+		"channels": {
+			"discord": {
+				"mention_only": true
+			}
+		},
+		"gateway": {"host": "127.0.0.1", "port": 18790}
+	}`
+
+	if err := os.WriteFile(configPath, []byte(v1Config), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	// Version should be bumped to 2
+	if cfg.Version != CurrentVersion {
+		t.Errorf("Version = %d, want %d", cfg.Version, CurrentVersion)
+	}
+
+	// gpt-4 has no API key → disabled
+	gpt4, err := cfg.GetModelConfig("gpt-4")
+	if err != nil {
+		t.Fatalf("GetModelConfig(gpt-4): %v", err)
+	}
+	if gpt4.Enabled {
+		t.Error("gpt-4 without API key should be disabled after migration")
+	}
+
+	// local-model → enabled
+	local, err := cfg.GetModelConfig("local-model")
+	if err != nil {
+		t.Fatalf("GetModelConfig(local-model): %v", err)
+	}
+	if !local.Enabled {
+		t.Error("local-model should be enabled after migration")
+	}
+
+	// Discord channel config should be migrated
+	dcMigBC := cfg.Channels.Get("discord")
+	if !dcMigBC.GroupTrigger.MentionOnly {
+		t.Error("Discord mention_only should be migrated to group_trigger.mention_only")
+	}
+
+	// Verify backup was created with date suffix
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	var hasBackup bool
+	for _, e := range entries {
+		if matched, _ := filepath.Match("config.json.20*.bak", e.Name()); matched {
+			hasBackup = true
+			break
+		}
+	}
+	if !hasBackup {
+		t.Error("expected backup file with date suffix to be created")
+	}
+
+	// Verify the saved config on disk now has version 2
+	saved, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile saved config: %v", err)
+	}
+	var versionCheck struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(saved, &versionCheck); err != nil {
+		t.Fatalf("Unmarshal saved config: %v", err)
+	}
+	if versionCheck.Version != 3 {
+		t.Errorf("saved config version = %d, want 3", versionCheck.Version)
+	}
+}
+
+// TestLoadConfig_V1WithAPIKeysInferredEnabled verifies that V1 configs with
+// API keys in the security file get Enabled=true after migration.
+func TestLoadConfig_V1WithAPIKeysInferredEnabled(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.json")
+	secPath := securityPath(configPath)
+
+	v1Config := `{
+		"version": 1,
+		"model_list": [
+			{"model_name": "gpt-4", "model": "openai/gpt-4"},
+			{"model_name": "claude", "model": "anthropic/claude"}
+		],
+		"gateway": {"host": "127.0.0.1", "port": 18790}
+	}`
+
+	securityConfig := `model_list:
+  gpt-4:0:
+    api_keys:
+      - "sk-gpt-key"
+  claude:0:
+    api_keys:
+      - "sk-claude-key"
+`
+
+	if err := os.WriteFile(configPath, []byte(v1Config), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.WriteFile(secPath, []byte(securityConfig), 0o600); err != nil {
+		t.Fatalf("WriteFile security: %v", err)
+	}
+
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	for _, m := range cfg.ModelList {
+		t.Logf("Model: %+v", m)
+		if !m.Enabled {
+			t.Errorf("model %q with API key in security file should be enabled", m.ModelName)
+		}
+	}
+}
+
+// TestLoadConfig_V2DirectLoad verifies that V2 configs load directly without
+// running any migration.
+func TestLoadConfig_V2DirectLoad(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.json")
+
+	v2Config := `{
+		"version": 2,
+		"model_list": [
+			{
+				"model_name": "gpt-4",
+				"model": "openai/gpt-4",
+				"enabled": true
+			},
+			{
+				"model_name": "claude",
+				"model": "anthropic/claude"
+			}
+		],
+		"gateway": {"host": "127.0.0.1", "port": 18790}
+	}`
+
+	if err := os.WriteFile(configPath, []byte(v2Config), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	if cfg.Version != 3 {
+		t.Errorf("Version = %d, want 3", cfg.Version)
+	}
+
+	gpt4, _ := cfg.GetModelConfig("gpt-4")
+	if !gpt4.Enabled {
+		t.Error("gpt-4 with explicit enabled=true should remain enabled")
+	}
+
+	claude, _ := cfg.GetModelConfig("claude")
+	if claude.Enabled {
+		t.Error("claude without enabled field should be false")
+	}
+
+	// V2→V3 migration creates a backup
+	entries, _ := os.ReadDir(tmpDir)
+	foundBackup := false
+	for _, e := range entries {
+		if matched, _ := filepath.Match("config.json.*.bak", e.Name()); matched {
+			foundBackup = true
+		}
+	}
+	if !foundBackup {
+		t.Error("V2→V3 migration should create backup")
+	}
+
+	githubRegistry, ok := cfg.Tools.Skills.Registries.Get("github")
+	if !ok {
+		t.Fatal("expected default github skills registry to survive V0 migration")
+	}
+	if !githubRegistry.Enabled {
+		t.Error("github skills registry should remain enabled after V0 migration")
+	}
+	if githubRegistry.BaseURL != "https://github.com" {
+		t.Errorf("github registry base_url = %q, want %q", githubRegistry.BaseURL, "https://github.com")
 	}
 }

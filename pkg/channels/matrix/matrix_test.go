@@ -14,6 +14,7 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/sipeed/picoclaw/pkg/channels"
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/media"
 )
@@ -38,6 +39,34 @@ func TestMatrixLocalpartMentionRegexp(t *testing.T) {
 		if got := re.MatchString(tc.text); got != tc.want {
 			t.Fatalf("text=%q match=%v want=%v", tc.text, got, tc.want)
 		}
+	}
+}
+
+func TestFinalizeTrackedToolFeedbackMessage_StopsTrackingBeforeEdit(t *testing.T) {
+	ch := &MatrixChannel{
+		progress: channels.NewToolFeedbackAnimator(nil),
+	}
+	ch.RecordToolFeedbackMessage("!room:matrix.org", "$event1", "🔧 `read_file`")
+
+	msgIDs, handled := ch.finalizeTrackedToolFeedbackMessage(
+		context.Background(),
+		"!room:matrix.org",
+		"final reply",
+		func(_ context.Context, chatID, messageID, content string) error {
+			if _, ok := ch.currentToolFeedbackMessage(chatID); ok {
+				t.Fatal("expected tracked tool feedback to be stopped before edit")
+			}
+			if chatID != "!room:matrix.org" || messageID != "$event1" || content != "final reply" {
+				t.Fatalf("unexpected edit args: %s %s %s", chatID, messageID, content)
+			}
+			return nil
+		},
+	)
+	if !handled {
+		t.Fatal("expected finalizeTrackedToolFeedbackMessage to handle tracked message")
+	}
+	if len(msgIDs) != 1 || msgIDs[0] != "$event1" {
+		t.Fatalf("finalizeTrackedToolFeedbackMessage() ids = %v, want [$event1]", msgIDs)
 	}
 }
 
@@ -341,32 +370,105 @@ func TestMatrixOutboundContent(t *testing.T) {
 }
 
 func TestMarkdownToHTML(t *testing.T) {
-	tests := []struct {
+	cases := []struct {
 		name     string
-		input    string
-		contains string
+		md       string
+		rendered string
 	}{
-		{"bold", "**hello**", "<strong>hello</strong>"},
-		{"italic", "_world_", "<em>world</em>"},
-		{"header", "### Title", "<h3"},
-		{"code block", "```\nfoo()\n```", "<code>"},
-		{"inline code", "`x`", "<code>x</code>"},
-		{"plain text", "just text", "just text"},
+		{
+			name:     "paragraph",
+			md:       "just **some** text with _custom_ formatting and `inline` code",
+			rendered: "<p>just <strong>some</strong> text with <em>custom</em> formatting and <code>inline</code> code</p>",
+		},
+		{
+			name:     "heading",
+			md:       "### Title",
+			rendered: `<h3>Title</h3>`,
+		},
+		{
+			name:     "fenced code block",
+			md:       "```\nfoo()\n```",
+			rendered: "<pre><code>foo()\n</code></pre>",
+		},
+		{
+			name: "loose list",
+			md:   "- Item one\n\n- Item two\n",
+			rendered: `<ul>
+<li><p>Item one</p></li>
+
+<li><p>Item two</p></li>
+</ul>`,
+		},
+		{
+			name: "tight list",
+			md:   "- Alpha\n- Beta\n",
+			rendered: `<ul>
+<li>Alpha</li>
+<li>Beta</li>
+</ul>`,
+		},
+		{
+			name: "list item with nested sublist",
+			md:   "1. Steps overview:\n\n   - Step A\n   - Step B\n",
+			rendered: `<ol>
+<li><p>Steps overview:</p>
+
+<ul>
+<li>Step A</li>
+<li>Step B</li>
+</ul></li>
+</ol>`,
+		},
+		{
+			// Definition list syntax is not enabled; the term and definition are
+			// rendered as a plain paragraph rather than <dl>/<dt>/<dd> elements.
+			name:     "definition list syntax renders as plain paragraph",
+			md:       "Term\n:   Definition of the term.\n",
+			rendered: "<p>Term\n:   Definition of the term.</p>",
+		},
+		{
+			name: "comprehensive document with headings, paragraphs, list, and code block",
+			md:   "# Overview\n\nThis is a sample document designed to demonstrate various Markdown elements in a single block of text.\n\nThe first paragraph introduces the concept of structured data.\n\n## Details\n\nThe following is a list:\n\n*   First\n*   Second\n*   Third\n\nThe second paragraph focuses on details. Below is a generic code snippet:\n\n```python\ndef calculate_area(radius):\n    import math\n    return math.pi * (radius ** 2)\n```\n\nThis concludes the generic sample text.\n",
+			rendered: `<h1>Overview</h1>
+
+<p>This is a sample document designed to demonstrate various Markdown elements in a single block of text.</p>
+
+<p>The first paragraph introduces the concept of structured data.</p>
+
+<h2>Details</h2>
+
+<p>The following is a list:</p>
+
+<ul>
+<li>First</li>
+<li>Second</li>
+<li>Third</li>
+</ul>
+
+<p>The second paragraph focuses on details. Below is a generic code snippet:</p>
+
+<pre><code class="language-python">def calculate_area(radius):
+    import math
+    return math.pi * (radius ** 2)
+</code></pre>
+
+<p>This concludes the generic sample text.</p>`,
+		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := markdownToHTML(tt.input)
-			if !strings.Contains(got, tt.contains) {
-				t.Fatalf("markdownToHTML(%q) = %q, want it to contain %q", tt.input, got, tt.contains)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := markdownToHTML(tc.md); got != tc.rendered {
+				t.Fatalf("markdownToHTML(%q)\n got: %q\nwant: %q", tc.md, got, tc.rendered)
 			}
 		})
 	}
 }
 
 func TestMessageContent(t *testing.T) {
-	richtext := &MatrixChannel{config: config.MatrixConfig{MessageFormat: "richtext"}}
-	plain := &MatrixChannel{config: config.MatrixConfig{MessageFormat: "plain"}}
-	defaultt := &MatrixChannel{config: config.MatrixConfig{}}
+	richtext := &MatrixChannel{config: &config.MatrixSettings{MessageFormat: "richtext"}}
+	plain := &MatrixChannel{config: &config.MatrixSettings{MessageFormat: "plain"}}
+	defaultt := &MatrixChannel{config: &config.MatrixSettings{}}
 
 	for _, c := range []*MatrixChannel{richtext, defaultt} {
 		mc := c.messageContent("**hi**")

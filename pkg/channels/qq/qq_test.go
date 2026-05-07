@@ -54,8 +54,8 @@ func TestHandleC2CMessage_IncludesAccountIDMetadata(t *testing.T) {
 			if !ok {
 				t.Fatal("expected inbound message")
 			}
-			if inbound.Metadata["account_id"] != "7750283E123456" {
-				t.Fatalf("account_id metadata = %q, want %q", inbound.Metadata["account_id"], "7750283E123456")
+			if inbound.Context.Raw["account_id"] != "7750283E123456" {
+				t.Fatalf("account_id raw = %q, want %q", inbound.Context.Raw["account_id"], "7750283E123456")
 			}
 			return
 		}
@@ -165,8 +165,8 @@ func TestHandleGroupATMessage_AttachmentOnlyPublishesMedia(t *testing.T) {
 	if !strings.HasPrefix(inbound.Media[0], "media://") {
 		t.Fatalf("inbound.Media[0] = %q, want media:// ref", inbound.Media[0])
 	}
-	if inbound.Peer.Kind != "group" || inbound.Peer.ID != "group-1" {
-		t.Fatalf("inbound.Peer = %+v, want group/group-1", inbound.Peer)
+	if inbound.Context.ChatType != "group" {
+		t.Fatalf("inbound.Context.ChatType = %q, want group", inbound.Context.ChatType)
 	}
 }
 
@@ -198,6 +198,7 @@ func TestSendMedia_UploadsLocalFileAsBase64(t *testing.T) {
 	}
 	ch := &QQChannel{
 		BaseChannel: channels.NewBaseChannel("qq", nil, messageBus, nil),
+		config:      &config.QQSettings{},
 		api:         api,
 		dedup:       make(map[string]time.Time),
 		done:        make(chan struct{}),
@@ -209,7 +210,7 @@ func TestSendMedia_UploadsLocalFileAsBase64(t *testing.T) {
 	ch.lastMsgID.Store("group-1", "msg-1")
 	ch.msgSeqCounters.Store("group-1", new(atomic.Uint64))
 
-	err = ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+	_, err = ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
 		ChatID: "group-1",
 		Parts: []bus.MediaPart{{
 			Type:    "image",
@@ -294,6 +295,7 @@ func assertAudioWAVUploadType(t *testing.T, duration time.Duration, wantFileType
 	}
 	ch := &QQChannel{
 		BaseChannel: channels.NewBaseChannel("qq", nil, messageBus, nil),
+		config:      &config.QQSettings{},
 		api:         api,
 		dedup:       make(map[string]time.Time),
 		done:        make(chan struct{}),
@@ -303,7 +305,7 @@ func assertAudioWAVUploadType(t *testing.T, duration time.Duration, wantFileType
 	ch.SetMediaStore(store)
 	ch.chatType.Store("group-1", "group")
 
-	err = ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+	_, err = ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
 		ChatID: "group-1",
 		Parts: []bus.MediaPart{{
 			Type: "audio",
@@ -329,6 +331,7 @@ func TestSendMedia_RemoteAudioFallsBackToFileUpload(t *testing.T) {
 	}
 	ch := &QQChannel{
 		BaseChannel: channels.NewBaseChannel("qq", nil, messageBus, nil),
+		config:      &config.QQSettings{},
 		api:         api,
 		dedup:       make(map[string]time.Time),
 		done:        make(chan struct{}),
@@ -337,7 +340,7 @@ func TestSendMedia_RemoteAudioFallsBackToFileUpload(t *testing.T) {
 	ch.SetRunning(true)
 	ch.chatType.Store("user-1", "direct")
 
-	err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+	_, err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
 		ChatID: "user-1",
 		Parts: []bus.MediaPart{{
 			Type: "audio",
@@ -374,6 +377,7 @@ func TestSendMedia_LocalAudioWithUnknownDurationFallsBackToFileUpload(t *testing
 	}
 	ch := &QQChannel{
 		BaseChannel: channels.NewBaseChannel("qq", nil, messageBus, nil),
+		config:      &config.QQSettings{},
 		api:         api,
 		dedup:       make(map[string]time.Time),
 		done:        make(chan struct{}),
@@ -383,7 +387,7 @@ func TestSendMedia_LocalAudioWithUnknownDurationFallsBackToFileUpload(t *testing
 	ch.SetMediaStore(store)
 	ch.chatType.Store("group-1", "group")
 
-	err = ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+	_, err = ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
 		ChatID: "group-1",
 		Parts: []bus.MediaPart{{
 			Type: "audio",
@@ -409,6 +413,7 @@ func TestSendMedia_UsesRemoteURLUploadForC2C(t *testing.T) {
 	}
 	ch := &QQChannel{
 		BaseChannel: channels.NewBaseChannel("qq", nil, messageBus, nil),
+		config:      &config.QQSettings{},
 		api:         api,
 		dedup:       make(map[string]time.Time),
 		done:        make(chan struct{}),
@@ -417,7 +422,7 @@ func TestSendMedia_UsesRemoteURLUploadForC2C(t *testing.T) {
 	ch.SetRunning(true)
 	ch.chatType.Store("user-1", "direct")
 
-	err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+	_, err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
 		ChatID: "user-1",
 		Parts: []bus.MediaPart{{
 			Type: "file",
@@ -481,6 +486,7 @@ func TestSendMedia_LocalFileUploadIncludesStoredFilename(t *testing.T) {
 	}
 	ch := &QQChannel{
 		BaseChannel: channels.NewBaseChannel("qq", nil, messageBus, nil),
+		config:      &config.QQSettings{},
 		api:         api,
 		dedup:       make(map[string]time.Time),
 		done:        make(chan struct{}),
@@ -490,7 +496,7 @@ func TestSendMedia_LocalFileUploadIncludesStoredFilename(t *testing.T) {
 	ch.SetMediaStore(store)
 	ch.chatType.Store("user-1", "direct")
 
-	err = ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+	_, err = ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
 		ChatID: "user-1",
 		Parts: []bus.MediaPart{{
 			Type: "file",
@@ -520,6 +526,7 @@ func TestSendMedia_ReturnsSendFailedWithoutMediaStore(t *testing.T) {
 	messageBus := bus.NewMessageBus()
 	ch := &QQChannel{
 		BaseChannel: channels.NewBaseChannel("qq", nil, messageBus, nil),
+		config:      &config.QQSettings{},
 		api:         &fakeQQAPI{},
 		dedup:       make(map[string]time.Time),
 		done:        make(chan struct{}),
@@ -528,7 +535,7 @@ func TestSendMedia_ReturnsSendFailedWithoutMediaStore(t *testing.T) {
 	ch.SetRunning(true)
 	ch.chatType.Store("group-1", "group")
 
-	err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+	_, err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
 		ChatID: "group-1",
 		Parts: []bus.MediaPart{{
 			Type: "image",
@@ -566,7 +573,7 @@ func TestSendMedia_ReturnsSendFailedWhenLocalFileExceedsBase64MiBLimit(t *testin
 	api := &fakeQQAPI{}
 	ch := &QQChannel{
 		BaseChannel: channels.NewBaseChannel("qq", nil, messageBus, nil),
-		config: config.QQConfig{
+		config: &config.QQSettings{
 			MaxBase64FileSizeMiB: 1,
 		},
 		api:   api,
@@ -578,7 +585,7 @@ func TestSendMedia_ReturnsSendFailedWhenLocalFileExceedsBase64MiBLimit(t *testin
 	ch.SetMediaStore(store)
 	ch.chatType.Store("group-1", "group")
 
-	err = ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+	_, err = ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
 		ChatID: "group-1",
 		Parts: []bus.MediaPart{{
 			Type: "file",

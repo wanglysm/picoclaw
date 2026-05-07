@@ -5,6 +5,13 @@
 
 package config
 
+import (
+	"os"
+	"path/filepath"
+
+	"github.com/sipeed/picoclaw/pkg"
+)
+
 // Runtime environment variable keys for the picoclaw process.
 // These control the location of files and binaries at runtime and are read
 // directly via os.Getenv / os.LookupEnv. All picoclaw-specific keys use the
@@ -32,6 +39,19 @@ const (
 	EnvBinary = "PICOCLAW_BINARY"
 
 	// EnvGatewayHost overrides the host address for the gateway server.
-	// Default: "127.0.0.1"
+	// Default: "localhost"
 	EnvGatewayHost = "PICOCLAW_GATEWAY_HOST"
 )
+
+func GetHome() string {
+	homePath, _ := os.UserHomeDir()
+	if picoclawHome := os.Getenv(EnvHome); picoclawHome != "" {
+		homePath = picoclawHome
+	} else if homePath != "" {
+		homePath = filepath.Join(homePath, pkg.DefaultPicoClawHome)
+	}
+	if homePath == "" {
+		homePath = "."
+	}
+	return homePath
+}
