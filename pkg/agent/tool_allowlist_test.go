@@ -68,6 +68,68 @@ tools: [serial, reaction, send_tts, load_image, delegate, made_up]
 	}
 }
 
+func TestResolveAgentToolAllowlistDistinguishesMissingAndEmptyToolsField(t *testing.T) {
+	tests := []struct {
+		name      string
+		agentMD   string
+		wantNil   bool
+		wantEmpty bool
+	}{
+		{
+			name: "missing tools field allows all tools",
+			agentMD: `---
+name: pico
+---
+# Agent
+`,
+			wantNil: true,
+		},
+		{
+			name: "explicit empty tools list blocks all tools",
+			agentMD: `---
+tools: []
+---
+# Agent
+`,
+			wantEmpty: true,
+		},
+		{
+			name: "blank tools field blocks all tools",
+			agentMD: `---
+tools:
+---
+# Agent
+`,
+			wantEmpty: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workspace := setupWorkspace(t, map[string]string{
+				"AGENT.md": tt.agentMD,
+			})
+			defer cleanupWorkspace(t, workspace)
+
+			allowlist := resolveAgentToolAllowlist(loadAgentDefinition(workspace))
+
+			if tt.wantNil {
+				if allowlist != nil {
+					t.Fatalf("resolveAgentToolAllowlist() = %v, want nil", allowlist)
+				}
+				return
+			}
+
+			if allowlist == nil {
+				t.Fatal("resolveAgentToolAllowlist() = nil, want explicit empty allowlist")
+			}
+			if len(allowlist) != 0 {
+				t.Fatalf("resolveAgentToolAllowlist() = %v, want empty allowlist", allowlist)
+			}
+		})
+	}
+}
+
 func TestUnknownAgentMCPServerNames(t *testing.T) {
 	workspace := setupWorkspace(t, map[string]string{
 		"AGENT.md": `---

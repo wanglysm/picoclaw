@@ -144,7 +144,7 @@ func resolveAgentToolAllowlist(definition AgentContextDefinition) []string {
 	if frontmatterParseFailed(definition) {
 		return []string{}
 	}
-	if definition.Agent == nil || definition.Agent.Frontmatter.Tools == nil {
+	if definition.Agent == nil || !frontmatterDeclaresField(definition, "tools") {
 		return nil
 	}
 
@@ -155,6 +155,10 @@ func resolveAgentToolAllowlist(definition AgentContextDefinition) []string {
 			continue
 		}
 		allowlist[trimmed] = struct{}{}
+	}
+
+	if len(allowlist) == 0 {
+		return []string{}
 	}
 
 	return sortedKeys(allowlist)

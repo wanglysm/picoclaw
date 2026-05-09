@@ -842,3 +842,60 @@ mcpServers: [github]
 		t.Fatal("expected malformed frontmatter to fail closed for MCP servers")
 	}
 }
+
+func TestNewAgentInstance_ExplicitEmptyToolsFieldBlocksAllTools(t *testing.T) {
+	tests := []struct {
+		name         string
+		toolsSnippet string
+	}{
+		{
+			name:         "empty list",
+			toolsSnippet: "tools: []",
+		},
+		{
+			name:         "blank field",
+			toolsSnippet: "tools:",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workspace := setupWorkspace(t, map[string]string{
+				"AGENT.md": `---
+` + tt.toolsSnippet + `
+---
+# Agent
+`,
+			})
+			defer cleanupWorkspace(t, workspace)
+
+			cfg := &config.Config{
+				Agents: config.AgentsConfig{
+					Defaults: config.AgentDefaults{
+						Workspace: workspace,
+						ModelName: "default-model",
+					},
+				},
+				Tools: config.ToolsConfig{
+					ReadFile: config.ReadFileToolConfig{Enabled: true},
+					ListDir:  config.ToolConfig{Enabled: true},
+				},
+			}
+
+			agent := NewAgentInstance(&config.AgentConfig{
+				ID:        "research",
+				Workspace: workspace,
+			}, &cfg.Agents.Defaults, cfg, &mockProvider{})
+
+			if got := agent.Tools.List(); len(got) != 0 {
+				t.Fatalf("agent tools = %v, want no registered tools", got)
+			}
+			if _, ok := agent.Tools.Get("read_file"); ok {
+				t.Fatal("expected read_file to be blocked by explicit empty tools field")
+			}
+			if _, ok := agent.Tools.Get("list_dir"); ok {
+				t.Fatal("expected list_dir to be blocked by explicit empty tools field")
+			}
+		})
+	}
+}
