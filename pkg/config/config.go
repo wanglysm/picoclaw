@@ -17,6 +17,7 @@ import (
 	"github.com/sipeed/picoclaw/pkg"
 	"github.com/sipeed/picoclaw/pkg/fileutil"
 	"github.com/sipeed/picoclaw/pkg/logger"
+	providercommon "github.com/sipeed/picoclaw/pkg/providers/common"
 )
 
 // rrCounter is a global counter for round-robin load balancing across models.
@@ -39,6 +40,7 @@ type Config struct {
 	Channels  ChannelsConfig  `json:"channel_list"        yaml:"channel_list"`
 	ModelList SecureModelList `json:"model_list"          yaml:"model_list"` // New model-centric provider configuration
 	Gateway   GatewayConfig   `json:"gateway"             yaml:"-"`
+	Events    EventsConfig    `json:"events,omitempty"    yaml:"-"`
 	Hooks     HooksConfig     `json:"hooks,omitempty"     yaml:"-"`
 	Tools     ToolsConfig     `json:"tools"               yaml:",inline"`
 	Heartbeat HeartbeatConfig `json:"heartbeat"           yaml:"-"`
@@ -276,6 +278,8 @@ type AgentDefaults struct {
 	SplitOnMarker             bool               `json:"split_on_marker"                  env:"PICOCLAW_AGENTS_DEFAULTS_SPLIT_ON_MARKER"` // split messages on <|[SPLIT]|> marker
 	ContextManager            string             `json:"context_manager,omitempty"        env:"PICOCLAW_AGENTS_DEFAULTS_CONTEXT_MANAGER"`
 	ContextManagerConfig      json.RawMessage    `json:"context_manager_config,omitempty" env:"PICOCLAW_AGENTS_DEFAULTS_CONTEXT_MANAGER_CONFIG"`
+	MaxLLMRetries             int                `json:"max_llm_retries,omitempty"        env:"PICOCLAW_AGENTS_DEFAULTS_MAX_LLM_RETRIES"`
+	LLMRetryBackoffSecs       int                `json:"llm_retry_backoff_secs,omitempty" env:"PICOCLAW_AGENTS_DEFAULTS_LLM_RETRY_BACKOFF_SECS"`
 }
 
 const DefaultMaxMediaSize = 20 * 1024 * 1024 // 20 MB
@@ -512,6 +516,17 @@ type TeamsWebhookTarget struct {
 	Title      string       `json:"title,omitempty"      yaml:"-"`
 }
 
+type MQTTSettings struct {
+	Broker      string       `json:"broker"                 yaml:"-"                  env:"PICOCLAW_CHANNELS_MQTT_BROKER"`
+	AgentID     string       `json:"agent_id"               yaml:"-"                  env:"PICOCLAW_CHANNELS_MQTT_AGENT_ID"`
+	TopicPrefix string       `json:"topic_prefix,omitempty" yaml:"-"                  env:"PICOCLAW_CHANNELS_MQTT_TOPIC_PREFIX"`
+	Username    SecureString `json:"username,omitzero"      yaml:"username,omitempty" env:"PICOCLAW_CHANNELS_MQTT_USERNAME"`
+	Password    SecureString `json:"password,omitzero"      yaml:"password,omitempty" env:"PICOCLAW_CHANNELS_MQTT_PASSWORD"`
+	ClientID    string       `json:"client_id,omitempty"    yaml:"-"                  env:"PICOCLAW_CHANNELS_MQTT_CLIENT_ID"`
+	KeepAlive   int          `json:"keep_alive,omitempty"   yaml:"-"                  env:"PICOCLAW_CHANNELS_MQTT_KEEP_ALIVE"`
+	QoS         int          `json:"qos,omitempty"          yaml:"-"                  env:"PICOCLAW_CHANNELS_MQTT_QOS"`
+}
+
 type HeartbeatConfig struct {
 	Enabled  bool `json:"enabled"  env:"PICOCLAW_HEARTBEAT_ENABLED"`
 	Interval int  `json:"interval" env:"PICOCLAW_HEARTBEAT_INTERVAL"` // minutes, min 5
@@ -553,12 +568,13 @@ type ModelConfig struct {
 	Workspace   string `json:"workspace,omitempty"`    // Workspace path for CLI-based providers
 
 	// Optional optimizations
-	RPM            int               `json:"rpm,omitempty"`              // Requests per minute limit
-	MaxTokensField string            `json:"max_tokens_field,omitempty"` // Field name for max tokens (e.g., "max_completion_tokens")
-	RequestTimeout int               `json:"request_timeout,omitempty"`
-	ThinkingLevel  string            `json:"thinking_level,omitempty"` // Extended thinking: off|low|medium|high|xhigh|adaptive
-	ExtraBody      map[string]any    `json:"extra_body,omitempty"`     // Additional fields to inject into request body
-	CustomHeaders  map[string]string `json:"custom_headers,omitempty"` // Additional headers to inject into every HTTP request
+	RPM                 int               `json:"rpm,omitempty"`              // Requests per minute limit
+	MaxTokensField      string            `json:"max_tokens_field,omitempty"` // Field name for max tokens (e.g., "max_completion_tokens")
+	RequestTimeout      int               `json:"request_timeout,omitempty"`
+	ThinkingLevel       string            `json:"thinking_level,omitempty"`        // Extended thinking: off|low|medium|high|xhigh|adaptive
+	ToolSchemaTransform string            `json:"tool_schema_transform,omitempty"` // Optional tool schema compatibility transform (e.g. "simple")
+	ExtraBody           map[string]any    `json:"extra_body,omitempty"`            // Additional fields to inject into request body
+	CustomHeaders       map[string]string `json:"custom_headers,omitempty"`        // Additional headers to inject into every HTTP request
 
 	APIKeys SecureStrings `json:"api_keys,omitzero" yaml:"api_keys,omitempty"` // API authentication keys (multiple keys for failover)
 
@@ -594,6 +610,9 @@ func (c *ModelConfig) Validate() error {
 	}
 	if c.Model == "" {
 		return fmt.Errorf("model is required")
+	}
+	if _, err := providercommon.NormalizeToolSchemaTransform(c.ToolSchemaTransform); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1466,23 +1485,24 @@ func expandMultiKeyModels(models []*ModelConfig) []*ModelConfig {
 
 			// Create a copy for the additional key
 			additionalEntry := &ModelConfig{
-				ModelName:      expandedName,
-				Provider:       m.Provider,
-				Model:          m.Model,
-				APIBase:        m.APIBase,
-				APIKeys:        SimpleSecureStrings(keys[i]),
-				Proxy:          m.Proxy,
-				AuthMethod:     m.AuthMethod,
-				ConnectMode:    m.ConnectMode,
-				Workspace:      m.Workspace,
-				RPM:            m.RPM,
-				MaxTokensField: m.MaxTokensField,
-				RequestTimeout: m.RequestTimeout,
-				ThinkingLevel:  m.ThinkingLevel,
-				ExtraBody:      m.ExtraBody,
-				CustomHeaders:  m.CustomHeaders,
-				UserAgent:      m.UserAgent,
-				isVirtual:      true,
+				ModelName:           expandedName,
+				Provider:            m.Provider,
+				Model:               m.Model,
+				APIBase:             m.APIBase,
+				APIKeys:             SimpleSecureStrings(keys[i]),
+				Proxy:               m.Proxy,
+				AuthMethod:          m.AuthMethod,
+				ConnectMode:         m.ConnectMode,
+				Workspace:           m.Workspace,
+				RPM:                 m.RPM,
+				MaxTokensField:      m.MaxTokensField,
+				RequestTimeout:      m.RequestTimeout,
+				ThinkingLevel:       m.ThinkingLevel,
+				ToolSchemaTransform: m.ToolSchemaTransform,
+				ExtraBody:           m.ExtraBody,
+				CustomHeaders:       m.CustomHeaders,
+				UserAgent:           m.UserAgent,
+				isVirtual:           true,
 			}
 			expanded = append(expanded, additionalEntry)
 			fallbackNames = append(fallbackNames, expandedName)
@@ -1490,22 +1510,23 @@ func expandMultiKeyModels(models []*ModelConfig) []*ModelConfig {
 
 		// Create the primary entry with first key and fallbacks
 		primaryEntry := &ModelConfig{
-			ModelName:      originalName,
-			Provider:       m.Provider,
-			Model:          m.Model,
-			APIBase:        m.APIBase,
-			Proxy:          m.Proxy,
-			AuthMethod:     m.AuthMethod,
-			ConnectMode:    m.ConnectMode,
-			Workspace:      m.Workspace,
-			RPM:            m.RPM,
-			MaxTokensField: m.MaxTokensField,
-			RequestTimeout: m.RequestTimeout,
-			ThinkingLevel:  m.ThinkingLevel,
-			ExtraBody:      m.ExtraBody,
-			CustomHeaders:  m.CustomHeaders,
-			UserAgent:      m.UserAgent,
-			APIKeys:        SimpleSecureStrings(keys[0]),
+			ModelName:           originalName,
+			Provider:            m.Provider,
+			Model:               m.Model,
+			APIBase:             m.APIBase,
+			Proxy:               m.Proxy,
+			AuthMethod:          m.AuthMethod,
+			ConnectMode:         m.ConnectMode,
+			Workspace:           m.Workspace,
+			RPM:                 m.RPM,
+			MaxTokensField:      m.MaxTokensField,
+			RequestTimeout:      m.RequestTimeout,
+			ThinkingLevel:       m.ThinkingLevel,
+			ToolSchemaTransform: m.ToolSchemaTransform,
+			ExtraBody:           m.ExtraBody,
+			CustomHeaders:       m.CustomHeaders,
+			UserAgent:           m.UserAgent,
+			APIKeys:             SimpleSecureStrings(keys[0]),
 		}
 
 		// Prepend new fallbacks to existing ones
